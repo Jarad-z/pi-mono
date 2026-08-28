@@ -17,6 +17,8 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type ManagedAgentSessionFailStopEvent,
+	type ManagedAgentSessionFailStopSink,
 	type ManagedAgentSessionLifecycleEvent,
 	type ManagedAgentSessionLifecycleSink,
 	type ManagedPromptOptions,

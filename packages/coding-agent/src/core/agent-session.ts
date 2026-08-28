@@ -15,23 +15,26 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import type {
-	Agent,
-	AgentEvent,
-	AgentMessage,
-	AgentState,
-	AgentTool,
-	ManagedQueueAbortResult,
-	ManagedQueueAdmissionResult,
-	ManagedQueueItemInput,
-	ManagedQueueMaterializationHook,
-	ManagedQueueMirrorItemSnapshot,
-	ManagedQueuePublishResult,
-	ManagedQueueRemovalResult,
-	ManagedQueueStageResult,
-	ManagedQueueTicket,
-	PrepareNextTurnContext,
-	ThinkingLevel,
+import {
+	type Agent,
+	type AgentEvent,
+	type AgentMessage,
+	type AgentState,
+	type AgentTool,
+	isManagedAgentFailStopError,
+	ManagedAgentFailStopError,
+	type ManagedAgentFailStopPhase,
+	type ManagedQueueAbortResult,
+	type ManagedQueueAdmissionResult,
+	type ManagedQueueItemInput,
+	type ManagedQueueMaterializationHook,
+	type ManagedQueueMirrorItemSnapshot,
+	type ManagedQueuePublishResult,
+	type ManagedQueueRemovalResult,
+	type ManagedQueueStageResult,
+	type ManagedQueueTicket,
+	type PrepareNextTurnContext,
+	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
 import type {
@@ -86,6 +89,7 @@ import {
 	type ExtensionUIContext,
 	type InputSource,
 	type ManagedExtensionHost,
+	type ManagedHostActivityBinding,
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
@@ -242,6 +246,8 @@ export interface AgentSessionConfig {
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 	/** Managed extension mutation gateway plus invocation-time tool activity scope provider. */
 	managedExtensionHost?: ManagedExtensionHost;
+	/** Awaited, single-owner generation fence invoked for managed correctness-boundary failures. */
+	managedFailStopSink?: ManagedAgentSessionFailStopSink;
 }
 
 export interface ExtensionBindings {
@@ -288,6 +294,22 @@ export type ManagedAgentSessionLifecycleSink = (
 	event: ManagedAgentSessionLifecycleEvent,
 	signal?: AbortSignal,
 ) => Promise<void>;
+
+export interface ManagedAgentSessionFailStopEvent {
+	readonly type: "managed_fail_stop";
+	readonly failureId: string;
+	readonly phase: ManagedAgentFailStopPhase;
+	readonly activityToken?: string;
+	readonly binding?: ManagedHostActivityBinding;
+	readonly error: {
+		readonly name: string;
+		readonly message: string;
+		readonly stack?: string;
+	};
+}
+
+/** Correctness-critical sink. It must durably fence the generation or reject. */
+export type ManagedAgentSessionFailStopSink = (event: ManagedAgentSessionFailStopEvent) => Promise<void>;
 
 /** Result from cycleModel() */
 export interface ModelCycleResult {
@@ -356,6 +378,11 @@ export class AgentSession {
 	private _resolveIdleWait: (() => void) | undefined;
 	private readonly _managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
 	private readonly _managedExtensionHost?: ManagedExtensionHost;
+	private readonly _managedFailureBindingProvider?: ManagedExtensionHost["getActivityBinding"];
+	private readonly _managedFailStopSink?: ManagedAgentSessionFailStopSink;
+	private _managedFailStopEvent: ManagedAgentSessionFailStopEvent | undefined;
+	private _managedFailStopPromise: Promise<void> | undefined;
+	private _managedFailStopSequence = 0;
 	private _managedPromptPreparationToken: string | undefined;
 	private _preparedManagedPrompt: { activityToken: string; messages: AgentMessage[] } | undefined;
 	private _activeManagedActivityToken: string | undefined;
@@ -436,10 +463,13 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._managedLifecycleSink = config.managedLifecycleSink;
+		this._managedFailStopSink = config.managedFailStopSink;
+		this._managedFailureBindingProvider = config.managedExtensionHost?.getActivityBinding;
 		this._managedExtensionHost = config.managedExtensionHost
 			? {
 					...config.managedExtensionHost,
 					getActivityBinding: () => {
+						if (this._managedFailStopEvent) return undefined;
 						const binding = config.managedExtensionHost?.getActivityBinding();
 						const expectedActivityToken = this._activeManagedActivityToken ?? this._managedPromptPreparationToken;
 						return binding?.activityToken === expectedActivityToken ? binding : undefined;
@@ -455,6 +485,12 @@ export class AgentSession {
 		if (config.managedExtensionHost && !config.managedLifecycleSink) {
 			throw new Error("Managed extension host requires a managed lifecycle sink");
 		}
+		if (config.managedLifecycleSink && !config.managedFailStopSink) {
+			throw new Error("Managed lifecycle requires a managed fail-stop sink");
+		}
+		if (config.managedFailStopSink && !config.managedLifecycleSink) {
+			throw new Error("Managed fail-stop sink requires a managed lifecycle sink");
+		}
 		if (config.managedQueueMaterializationHook && this.agent.hasQueuedMessages()) {
 			throw new Error("Managed queue materialization cannot adopt legacy queued messages");
 		}
@@ -468,11 +504,22 @@ export class AgentSession {
 		if (config.managedQueueMaterializationHook) {
 			this.agent.managedQueueMaterializationHook = config.managedQueueMaterializationHook;
 		}
+		if (config.managedFailStopSink) {
+			if (this.agent.managedFailStopHandler) {
+				throw new Error("Agent already has a managed fail-stop handler");
+			}
+			this.agent.managedFailStopHandler = (failure) => this._triggerManagedFailStop(failure);
+		}
 		if (
 			this.sessionManager.isManaged() &&
-			(!config.managedLifecycleSink || !this.agent.managedQueueMaterializationHook || !config.managedExtensionHost)
+			(!config.managedLifecycleSink ||
+				!this.agent.managedQueueMaterializationHook ||
+				!config.managedExtensionHost ||
+				!config.managedFailStopSink)
 		) {
-			throw new Error("Managed SessionStore requires lifecycle, queue materialization, and extension host hooks");
+			throw new Error(
+				"Managed SessionStore requires lifecycle, queue materialization, extension host, and fail-stop hooks",
+			);
 		}
 
 		// Always subscribe to agent events for internal handling
@@ -695,6 +742,89 @@ export class AgentSession {
 			this._managedSettlementPending = false;
 			this._resolveIdleWaitIfIdle();
 		}
+	}
+
+	private assertManagedGenerationAvailable(): void {
+		if (!this._managedFailStopEvent) return;
+		throw new ManagedAgentFailStopError(
+			this._managedFailStopEvent.phase,
+			`Managed AgentSession generation is fail-stopped: ${this._managedFailStopEvent.error.message}`,
+		);
+	}
+
+	private async _triggerManagedFailStop(failure: ManagedAgentFailStopError): Promise<void> {
+		if (this._managedFailStopPromise) {
+			await this._managedFailStopPromise;
+			return;
+		}
+		const sink = this._managedFailStopSink;
+		if (!sink) throw failure;
+
+		const activityToken = this._activeManagedActivityToken ?? this._managedPromptPreparationToken;
+		let binding: ManagedHostActivityBinding | undefined;
+		try {
+			binding = this._managedFailureBindingProvider?.();
+		} catch {
+			// Failure reporting must remain available even if the live binding source is already broken.
+			binding = undefined;
+		}
+		const failureId = `${binding?.generationId ?? "unbound"}:${activityToken ?? "no_activity"}:fail-stop:${++this._managedFailStopSequence}`;
+		const event: ManagedAgentSessionFailStopEvent = {
+			type: "managed_fail_stop",
+			failureId,
+			phase: failure.phase,
+			activityToken,
+			binding,
+			error: {
+				name: failure.name,
+				message: failure.message,
+				stack: failure.stack,
+			},
+		};
+		this._managedFailStopEvent = event;
+		this._preparedManagedPrompt = undefined;
+		this.agent.abort();
+		this._compactionAbortController?.abort(failure);
+		this._autoCompactionAbortController?.abort(failure);
+		this._branchSummaryAbortController?.abort(failure);
+		this._retryAbortController?.abort(failure);
+		for (const controller of this._bashAbortControllers) controller.abort(failure);
+
+		const bridge = Promise.resolve()
+			.then(() => sink(event))
+			.catch((error) => {
+				if (isManagedAgentFailStopError(error)) throw error;
+				throw new ManagedAgentFailStopError(
+					"fail_stop_bridge",
+					`Managed AgentSession fail-stop sink failed: ${error instanceof Error ? error.message : String(error)}`,
+					{ cause: error },
+				);
+			});
+		this._managedFailStopPromise = bridge;
+		await bridge;
+	}
+
+	private async failStopManagedBoundary(
+		error: unknown,
+		phase: ManagedAgentFailStopPhase,
+	): Promise<ManagedAgentFailStopError> {
+		const failure = isManagedAgentFailStopError(error)
+			? error
+			: new ManagedAgentFailStopError(
+					phase,
+					`Managed AgentSession ${phase} failed: ${error instanceof Error ? error.message : String(error)}`,
+					{ cause: error },
+				);
+		await this._triggerManagedFailStop(failure);
+		return failure;
+	}
+
+	get isManagedFailStopped(): boolean {
+		return this._managedFailStopEvent !== undefined;
+	}
+
+	get managedFailStopEvent(): ManagedAgentSessionFailStopEvent | undefined {
+		return this._managedFailStopEvent;
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -1190,16 +1320,34 @@ export class AgentSession {
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		this._isAgentRunActive = true;
+		let runFailed = false;
+		let runError: unknown;
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
-		} finally {
-			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+		} catch (error) {
+			runFailed = true;
+			runError = error;
 		}
+
+		this._systemPromptOverride = undefined;
+		if (this._managedFailStopEvent) {
+			this._pendingBashMessages = [];
+			this._isAgentRunActive = false;
+			this._managedSettlementPending = false;
+			this._resolveIdleWaitIfIdle();
+		} else {
+			try {
+				this._flushPendingBashMessages();
+				await this._emitAgentSettled();
+			} catch (error) {
+				if (!this._managedFailStopSink) throw error;
+				throw await this.failStopManagedBoundary(error, "agent_settled");
+			}
+		}
+		if (runFailed) throw runError;
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1263,6 +1411,7 @@ export class AgentSession {
 		text: string,
 		options?: ManagedPromptOptions,
 	): Promise<ManagedPromptPreparation> {
+		this.assertManagedGenerationAvailable();
 		if (!this._managedLifecycleSink) {
 			throw new Error("Managed prompt launch requires a managed lifecycle sink");
 		}
@@ -1297,10 +1446,14 @@ export class AgentSession {
 			}
 			if (this.sessionManager.isManaged()) {
 				if (!options?.reservedEntryId) {
-					throw new Error("Managed prompt requires a host-reserved initial Entry identity");
+					throw new ManagedAgentFailStopError(
+						"preflight",
+						"Managed prompt requires a host-reserved initial Entry identity",
+					);
 				}
 				if (messages.length !== 1 || messages[0]?.role !== "user") {
-					throw new Error(
+					throw new ManagedAgentFailStopError(
+						"preflight",
 						"Managed prompt cannot accept extension-injected messages without reserved Entry identities",
 					);
 				}
@@ -1308,6 +1461,11 @@ export class AgentSession {
 			}
 			this._preparedManagedPrompt = { activityToken, messages };
 			return { outcome: "ready", activityToken };
+		} catch (error) {
+			if (isManagedAgentFailStopError(error)) {
+				await this._triggerManagedFailStop(error);
+			}
+			throw error;
 		} finally {
 			this._managedPromptPreparationToken = undefined;
 		}
@@ -1315,6 +1473,7 @@ export class AgentSession {
 
 	/** Start a previously prepared managed prompt with its stable activity token. */
 	async launchManagedPrompt(activityToken: string): Promise<void> {
+		this.assertManagedGenerationAvailable();
 		const prepared = this._preparedManagedPrompt;
 		if (!prepared || prepared.activityToken !== activityToken) {
 			throw new Error(`No prepared managed prompt exists for activity token ${activityToken}`);
@@ -1334,6 +1493,7 @@ export class AgentSession {
 
 	/** Cancel a prepared prompt before launch. Returns false for a stale or different token. */
 	cancelManagedPrompt(activityToken: string): boolean {
+		this.assertManagedGenerationAvailable();
 		if (this._preparedManagedPrompt?.activityToken !== activityToken) {
 			return false;
 		}
@@ -1350,30 +1510,35 @@ export class AgentSession {
 
 	/** Stage a stable managed queue item without making it drainable. */
 	stageManagedQueueItem(input: ManagedQueueItemInput): ManagedQueueStageResult {
+		this.assertManagedGenerationAvailable();
 		this.assertManagedQueueBridge();
 		return this.agent.stageManagedQueueItem(input);
 	}
 
 	/** Acknowledge durable admission for a staged managed queue item. */
 	admitManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueueAdmissionResult {
+		this.assertManagedGenerationAvailable();
 		this.assertManagedQueueBridge();
 		return this.agent.admitManagedQueueItem(ticket);
 	}
 
 	/** Publish a durably admitted managed queue item to its delivery lane. */
 	publishManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueuePublishResult {
+		this.assertManagedGenerationAvailable();
 		this.assertManagedQueueBridge();
 		return this.agent.publishManagedQueueItem(ticket);
 	}
 
 	/** Abort a staged/admitted managed queue ticket. */
 	abortManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueueAbortResult {
+		this.assertManagedGenerationAvailable();
 		this.assertManagedQueueBridge();
 		return this.agent.abortManagedQueueItem(ticket);
 	}
 
 	/** Remove a managed item unless dequeue selection has already won. */
 	removeManagedQueueItem(itemId: string): ManagedQueueRemovalResult {
+		this.assertManagedGenerationAvailable();
 		this.assertManagedQueueBridge();
 		return this.agent.removeManagedQueueItem(itemId);
 	}
@@ -1578,6 +1743,7 @@ export class AgentSession {
 				event: "command",
 				error: err instanceof Error ? err.message : String(err),
 			});
+			if (this._managedFailStopSink && isManagedAgentFailStopError(err)) throw err;
 			return true;
 		}
 	}
@@ -2620,6 +2786,7 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		this.assertManagedGenerationAvailable();
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -2640,8 +2807,13 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-		await this._extensionRunner.emit(this._sessionStartEvent);
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		try {
+			await this._extensionRunner.emit(this._sessionStartEvent);
+			await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		} catch (error) {
+			if (!this._managedFailStopSink) throw error;
+			throw await this.failStopManagedBoundary(error, "managed_host_boundary");
+		}
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {

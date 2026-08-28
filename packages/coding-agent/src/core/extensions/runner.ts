@@ -3,7 +3,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import { type AgentMessage, type AgentToolResult, ManagedAgentFailStopError } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, Provider, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
@@ -83,9 +83,9 @@ interface ActiveManagedActionScope {
 	open: boolean;
 }
 
-class ManagedExtensionBoundaryError extends Error {
+class ManagedExtensionBoundaryError extends ManagedAgentFailStopError {
 	constructor(message: string, options?: ErrorOptions) {
-		super(message, options);
+		super("managed_host_boundary", message, options);
 		this.name = "ManagedExtensionBoundaryError";
 	}
 }

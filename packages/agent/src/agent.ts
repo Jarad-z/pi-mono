@@ -21,6 +21,7 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	ManagedAgentFailStopHandler,
 	ManagedQueueAbortResult,
 	ManagedQueueAdmissionResult,
 	ManagedQueueItemInput,
@@ -39,6 +40,7 @@ import type {
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.ts";
+import { isManagedAgentFailStopError, ManagedAgentFailStopError } from "./types.ts";
 
 export type { QueueMode } from "./types.ts";
 
@@ -129,6 +131,8 @@ export interface AgentOptions {
 	followUpMode?: QueueMode;
 	/** Enables stable managed queue admission and the awaited pre-visibility materialization barrier. */
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
+	/** Awaited generation fail-stop bridge for managed correctness-boundary failures. */
+	managedFailStopHandler?: ManagedAgentFailStopHandler;
 	sessionId?: string;
 	thinkingBudgets?: ThinkingBudgets;
 	transport?: Transport;
@@ -237,6 +241,8 @@ export class Agent {
 	private readonly managedMessageEntryReservations = new WeakMap<object, string>();
 	private managedQueueMirrorRevision = 0;
 	private managedQueueFailure: Error | undefined;
+	private managedFailStopError: ManagedAgentFailStopError | undefined;
+	private managedFailStopPromise: Promise<void> | undefined;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -264,6 +270,7 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	public managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
+	public managedFailStopHandler?: ManagedAgentFailStopHandler;
 	private activeRun?: ActiveRun;
 	private activeRunHasStarted = false;
 	private activeRunTurnOpen = false;
@@ -294,6 +301,7 @@ export class Agent {
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.managedQueueMaterializationHook = runtimeOptions.managedQueueMaterializationHook;
+		this.managedFailStopHandler = runtimeOptions.managedFailStopHandler;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(runtimeOptions.followUpMode ?? "one-at-a-time");
 		this.sessionId = runtimeOptions.sessionId;
@@ -347,18 +355,21 @@ export class Agent {
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
 	steer(message: AgentMessage): void {
+		this.assertManagedGenerationAvailable();
 		this.assertLegacyQueueAccess();
 		this.steeringQueue.enqueue(message);
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
 	followUp(message: AgentMessage): void {
+		this.assertManagedGenerationAvailable();
 		this.assertLegacyQueueAccess();
 		this.followUpQueue.enqueue(message);
 	}
 
 	/** Provisionally stage a stable, non-drainable managed queue envelope. */
 	stageManagedQueueItem(input: ManagedQueueItemInput): ManagedQueueStageResult {
+		this.assertManagedGenerationAvailable();
 		if (!this.managedQueueMaterializationHook) {
 			throw new Error("Managed queue staging requires a managed queue materialization hook");
 		}
@@ -396,6 +407,7 @@ export class Agent {
 
 	/** Mark a provisional managed item as durably admitted, without making it drainable. */
 	admitManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueueAdmissionResult {
+		this.assertManagedGenerationAvailable();
 		const item = this.resolveTicket(ticket);
 		if (!item) {
 			return this.isConsumedTicket(ticket) ? "already_admitted" : "stale";
@@ -409,6 +421,7 @@ export class Agent {
 
 	/** Publish a durably admitted managed item so the next matching drain may select it. */
 	publishManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueuePublishResult {
+		this.assertManagedGenerationAvailable();
 		const item = this.resolveTicket(ticket);
 		if (!item) {
 			return this.isConsumedTicket(ticket) ? "already_published" : "stale";
@@ -425,6 +438,7 @@ export class Agent {
 
 	/** Abort a staged/admitted ticket. Published or selected items cannot be rolled back by admission abort. */
 	abortManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueueAbortResult {
+		this.assertManagedGenerationAvailable();
 		const item = this.resolveTicket(ticket);
 		if (!item) {
 			return this.isConsumedTicket(ticket) ? "already_consumed" : "stale";
@@ -441,6 +455,7 @@ export class Agent {
 
 	/** Remove a managed item unless synchronous dequeue selection has already won. */
 	removeManagedQueueItem(itemId: string): ManagedQueueRemovalResult {
+		this.assertManagedGenerationAvailable();
 		const item = this.managedQueueItems.get(itemId);
 		if (!item) {
 			return this.consumedManagedQueueItems.has(itemId) ? "already_consumed" : "not_found";
@@ -505,6 +520,16 @@ export class Agent {
 		}
 	}
 
+	private assertManagedGenerationAvailable(): void {
+		if (this.managedFailStopError) {
+			throw new ManagedAgentFailStopError(
+				this.managedFailStopError.phase,
+				`Managed Agent generation is fail-stopped: ${this.managedFailStopError.message}`,
+				{ cause: this.managedFailStopError },
+			);
+		}
+	}
+
 	private queueFor(lane: ManagedQueueLane): PendingMessageQueue {
 		return lane === "steer" ? this.steeringQueue : this.followUpQueue;
 	}
@@ -545,12 +570,14 @@ export class Agent {
 
 	/** Remove all queued steering messages. */
 	clearSteeringQueue(): void {
+		this.assertManagedGenerationAvailable();
 		this.assertLegacyQueueAccess();
 		this.forgetClearedManagedItems(this.steeringQueue.clear());
 	}
 
 	/** Remove all queued follow-up messages. */
 	clearFollowUpQueue(): void {
+		this.assertManagedGenerationAvailable();
 		this.assertLegacyQueueAccess();
 		this.forgetClearedManagedItems(this.followUpQueue.clear());
 	}
@@ -587,6 +614,7 @@ export class Agent {
 
 	/** Clear transcript state, runtime state, and queued messages. */
 	reset(): void {
+		this.assertManagedGenerationAvailable();
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before resetting.");
 		}
@@ -607,6 +635,7 @@ export class Agent {
 	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
 	async prompt(input: string, images?: ImageContent[]): Promise<void>;
 	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+		this.assertManagedGenerationAvailable();
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
@@ -618,6 +647,7 @@ export class Agent {
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
 	async continue(): Promise<void> {
+		this.assertManagedGenerationAvailable();
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -780,7 +810,9 @@ export class Agent {
 				item.phase = "failed";
 			}
 			this.managedQueueFailure = failure;
-			throw failure;
+			throw this.managedFailStopHandler
+				? new ManagedAgentFailStopError("queue_materialization", failure.message, { cause: failure })
+				: failure;
 		}
 
 		const messages: AgentMessage[] = [];
@@ -851,9 +883,49 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
-			await this.handleRunFailure(error, abortController.signal.aborted);
+			let runError = error;
+			if (!isManagedAgentFailStopError(runError)) {
+				try {
+					await this.handleRunFailure(runError, abortController.signal.aborted);
+					return;
+				} catch (failureEventError) {
+					runError = failureEventError;
+				}
+			}
+			if (isManagedAgentFailStopError(runError)) {
+				await this.triggerManagedFailStop(runError);
+			}
+			throw runError;
 		} finally {
 			this.finishRun();
+		}
+	}
+
+	private async triggerManagedFailStop(error: ManagedAgentFailStopError): Promise<void> {
+		if (this.managedFailStopPromise) {
+			await this.managedFailStopPromise;
+			return;
+		}
+		this.managedFailStopError = error;
+		this.activeRun?.abortController.abort(error);
+		const handler = this.managedFailStopHandler;
+		if (!handler) throw error;
+		const bridge = handler(error);
+		this.managedFailStopPromise = bridge;
+		try {
+			await bridge;
+		} catch (bridgeError) {
+			if (isManagedAgentFailStopError(bridgeError)) {
+				this.managedFailStopError = bridgeError;
+				throw bridgeError;
+			}
+			const failure = new ManagedAgentFailStopError(
+				"fail_stop_bridge",
+				`Managed Agent fail-stop bridge failed: ${bridgeError instanceof Error ? bridgeError.message : String(bridgeError)}`,
+				{ cause: bridgeError },
+			);
+			this.managedFailStopError = failure;
+			throw failure;
 		}
 	}
 
@@ -952,7 +1024,16 @@ export class Agent {
 			throw new Error("Agent listener invoked outside active run");
 		}
 		for (const listener of this.listeners) {
-			await listener(event, signal);
+			try {
+				await listener(event, signal);
+			} catch (error) {
+				if (isManagedAgentFailStopError(error) || !this.managedFailStopHandler) throw error;
+				throw new ManagedAgentFailStopError(
+					"lifecycle_listener",
+					`Managed Agent ${event.type} listener failed: ${error instanceof Error ? error.message : String(error)}`,
+					{ cause: error },
+				);
+			}
 		}
 	}
 }

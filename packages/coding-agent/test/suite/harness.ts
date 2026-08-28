@@ -18,6 +18,7 @@ import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat
 import {
 	AgentSession,
 	type AgentSessionEvent,
+	type ManagedAgentSessionFailStopSink,
 	type ManagedAgentSessionLifecycleSink,
 } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
@@ -77,6 +78,7 @@ export interface HarnessOptions {
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
+	managedFailStopSink?: ManagedAgentSessionFailStopSink;
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 	managedExtensionHost?: ManagedExtensionHost;
 	sessionManager?: SessionManager;
@@ -200,6 +202,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
 		managedLifecycleSink: options.managedLifecycleSink,
+		managedFailStopSink: options.managedFailStopSink,
 		managedQueueMaterializationHook: options.managedQueueMaterializationHook,
 		managedExtensionHost: options.managedExtensionHost,
 	});

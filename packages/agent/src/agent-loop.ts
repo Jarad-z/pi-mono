@@ -21,6 +21,7 @@ import type {
 	AgentToolResult,
 	StreamFn,
 } from "./types.ts";
+import { isManagedAgentFailStopError } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
@@ -659,6 +660,7 @@ async function prepareToolCall(
 			args: validatedArgs,
 		};
 	} catch (error) {
+		if (isManagedAgentFailStopError(error)) throw error;
 		return {
 			kind: "immediate",
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
@@ -701,6 +703,7 @@ async function executePreparedToolCall(
 	} catch (error) {
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
+		if (isManagedAgentFailStopError(error)) throw error;
 		return {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
@@ -745,6 +748,7 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
+			if (isManagedAgentFailStopError(error)) throw error;
 			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
 			isError = true;
 		}

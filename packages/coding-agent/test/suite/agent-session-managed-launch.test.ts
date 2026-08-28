@@ -1,6 +1,7 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
+	ManagedAgentSessionFailStopEvent,
 	ManagedAgentSessionLifecycleEvent,
 	ManagedAgentSessionLifecycleSink,
 } from "../../src/core/agent-session.ts";
@@ -37,6 +38,8 @@ function managedExtensionHost(activityToken: string): ManagedExtensionHost {
 		executeTool: async (_scope, execute) => execute(),
 	};
 }
+
+async function ignoreManagedFailStop(): Promise<void> {}
 
 class ManagedLaunchSessionStore implements ManagedSessionStore {
 	readonly entries: SessionEntry[] = [];
@@ -99,6 +102,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			managedLifecycleSink: sink,
 			managedExtensionHost: managedExtensionHost("activity_1"),
+			managedFailStopSink: ignoreManagedFailStop,
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
@@ -137,6 +141,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			managedLifecycleSink: sink,
 			managedExtensionHost: managedExtensionHost("activity_2"),
+			managedFailStopSink: ignoreManagedFailStop,
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
@@ -164,6 +169,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			managedLifecycleSink: sink,
 			managedExtensionHost: managedExtensionHost("activity_3"),
+			managedFailStopSink: ignoreManagedFailStop,
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
@@ -192,6 +198,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			managedLifecycleSink: async () => {},
 			managedExtensionHost: managedExtensionHost("activity_4"),
+			managedFailStopSink: ignoreManagedFailStop,
 		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("unused")]);
@@ -213,6 +220,7 @@ describe("AgentSession managed paused launch", () => {
 				lifecycle.push(event);
 			},
 			managedExtensionHost: managedExtensionHost("activity_5"),
+			managedFailStopSink: ignoreManagedFailStop,
 			extensionFactories: [
 				(pi) => {
 					pi.registerCommand("managed", {
@@ -239,6 +247,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			managedLifecycleSink: async () => {},
 			managedExtensionHost: managedExtensionHost("unused"),
+			managedFailStopSink: ignoreManagedFailStop,
 		});
 		harnesses.push(harness);
 
@@ -251,6 +260,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			managedLifecycleSink: async () => {},
 			managedExtensionHost: managedExtensionHost("activity_6"),
+			managedFailStopSink: ignoreManagedFailStop,
 			managedQueueMaterializationHook: async (items) =>
 				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
 		});
@@ -291,6 +301,7 @@ describe("AgentSession managed paused launch", () => {
 			sessionManager,
 			managedLifecycleSink: async () => {},
 			managedExtensionHost: managedExtensionHost("activity_7"),
+			managedFailStopSink: ignoreManagedFailStop,
 			managedQueueMaterializationHook: async (items) =>
 				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
 		});
@@ -319,6 +330,7 @@ describe("AgentSession managed paused launch", () => {
 			sessionManager,
 			managedLifecycleSink: async () => {},
 			managedExtensionHost: managedExtensionHost("activity_8"),
+			managedFailStopSink: ignoreManagedFailStop,
 			managedQueueMaterializationHook: async (items) =>
 				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
 		});
@@ -329,5 +341,112 @@ describe("AgentSession managed paused launch", () => {
 		);
 		expect(store.entries).toEqual([]);
 		expect(harness.session.hasPreparedManagedPrompt).toBe(false);
+	});
+
+	it("fences exactly once when the durable lifecycle barrier rejects", async () => {
+		const lifecycle: ManagedAgentSessionLifecycleEvent[] = [];
+		const failStops: ManagedAgentSessionFailStopEvent[] = [];
+		const harness = await createHarness({
+			managedLifecycleSink: async (event) => {
+				lifecycle.push(event);
+				if (event.type === "agent_event" && event.event.type === "agent_start") {
+					throw new Error("durable agent_start rejected");
+				}
+			},
+			managedExtensionHost: managedExtensionHost("activity_fail_start"),
+			managedFailStopSink: async (event) => {
+				failStops.push(event);
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("must remain pending")]);
+		await harness.session.prepareManagedPrompt("activity_fail_start", "hello");
+
+		await expect(harness.session.launchManagedPrompt("activity_fail_start")).rejects.toMatchObject({
+			name: "ManagedAgentFailStopError",
+			phase: "lifecycle_listener",
+		});
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(lifecycle).toHaveLength(1);
+		expect(failStops).toEqual([
+			expect.objectContaining({
+				type: "managed_fail_stop",
+				phase: "lifecycle_listener",
+				activityToken: "activity_fail_start",
+				binding: expect.objectContaining({
+					generationId: "generation_1",
+					generationLeaseToken: "lease_1",
+					activityToken: "activity_fail_start",
+				}),
+			}),
+		]);
+		expect(harness.session.isManagedFailStopped).toBe(true);
+		await expect(harness.session.prepareManagedPrompt("activity_after_failure", "again")).rejects.toThrow(
+			"fail-stopped",
+		);
+		expect(failStops).toHaveLength(1);
+	});
+
+	it("fences after Provider completion when the durable settlement barrier rejects", async () => {
+		const lifecycle: ManagedAgentSessionLifecycleEvent[] = [];
+		const failStops: ManagedAgentSessionFailStopEvent[] = [];
+		const harness = await createHarness({
+			managedLifecycleSink: async (event) => {
+				lifecycle.push(event);
+				if (event.type === "agent_settled") throw new Error("durable settlement rejected");
+			},
+			managedExtensionHost: managedExtensionHost("activity_fail_settlement"),
+			managedFailStopSink: async (event) => {
+				failStops.push(event);
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.prepareManagedPrompt("activity_fail_settlement", "hello");
+
+		await expect(harness.session.launchManagedPrompt("activity_fail_settlement")).rejects.toMatchObject({
+			name: "ManagedAgentFailStopError",
+			phase: "agent_settled",
+		});
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(lifecycle.at(-1)).toEqual({ type: "agent_settled", activityToken: "activity_fail_settlement" });
+		expect(harness.events.some((event) => event.type === "agent_settled")).toBe(false);
+		expect(failStops).toEqual([
+			expect.objectContaining({
+				phase: "agent_settled",
+				activityToken: "activity_fail_settlement",
+			}),
+		]);
+		expect(harness.session.isManagedFailStopped).toBe(true);
+	});
+
+	it("keeps the session locally fenced when the fail-stop sink itself rejects", async () => {
+		let failStopCalls = 0;
+		const harness = await createHarness({
+			managedLifecycleSink: async (event) => {
+				if (event.type === "agent_event" && event.event.type === "agent_start") {
+					throw new Error("durable agent_start rejected");
+				}
+			},
+			managedExtensionHost: managedExtensionHost("activity_fail_bridge"),
+			managedFailStopSink: async () => {
+				failStopCalls++;
+				throw new Error("generation fence transaction rejected");
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("must remain pending")]);
+		await harness.session.prepareManagedPrompt("activity_fail_bridge", "hello");
+
+		await expect(harness.session.launchManagedPrompt("activity_fail_bridge")).rejects.toMatchObject({
+			name: "ManagedAgentFailStopError",
+			phase: "fail_stop_bridge",
+		});
+		expect(harness.session.isManagedFailStopped).toBe(true);
+		expect(failStopCalls).toBe(1);
+		await expect(harness.session.prepareManagedPrompt("activity_after_bridge_failure", "again")).rejects.toThrow(
+			"fail-stopped",
+		);
+		expect(failStopCalls).toBe(1);
 	});
 });

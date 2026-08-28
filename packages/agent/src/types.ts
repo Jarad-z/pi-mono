@@ -115,6 +115,33 @@ export type ManagedQueueMaterializationHook = (
 	signal: AbortSignal,
 ) => Promise<readonly ManagedQueueMaterializationDecision[]>;
 
+/** Managed correctness boundary whose failure requires the owning generation to stop. */
+export type ManagedAgentFailStopPhase =
+	| "lifecycle_listener"
+	| "queue_materialization"
+	| "managed_host_boundary"
+	| "agent_settled"
+	| "preflight"
+	| "fail_stop_bridge";
+
+/** Runtime-recognizable failure that must not be converted into ordinary assistant/tool output. */
+export class ManagedAgentFailStopError extends Error {
+	readonly phase: ManagedAgentFailStopPhase;
+
+	constructor(phase: ManagedAgentFailStopPhase, message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "ManagedAgentFailStopError";
+		this.phase = phase;
+	}
+}
+
+export function isManagedAgentFailStopError(error: unknown): error is ManagedAgentFailStopError {
+	return error instanceof ManagedAgentFailStopError;
+}
+
+/** Awaited host bridge invoked once before a managed Agent run releases its local runtime state. */
+export type ManagedAgentFailStopHandler = (failure: ManagedAgentFailStopError) => Promise<void>;
+
 /** Read-only evidence for reconciliation and generation shutdown. */
 export interface ManagedQueueMirrorItemSnapshot {
 	readonly itemId: string;
