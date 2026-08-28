@@ -225,6 +225,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional managed-host lifecycle sink. Enabling it requires typed managed prompt launch. */
+	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
 }
 
 export interface ExtensionBindings {
@@ -249,6 +251,25 @@ export interface PromptOptions {
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
 }
+
+/** Prompt options accepted by the managed paused-launch API. */
+export type ManagedPromptOptions = Omit<PromptOptions, "streamingBehavior" | "preflightResult">;
+
+/** Result of managed prompt preflight before provider-visible execution is allowed to start. */
+export type ManagedPromptPreparation =
+	| { outcome: "ready"; activityToken: string }
+	| { outcome: "handled"; activityToken: string };
+
+/** Correlated lifecycle event delivered to the managed host before normal session observers. */
+export type ManagedAgentSessionLifecycleEvent =
+	| { type: "agent_event"; activityToken: string; event: AgentEvent }
+	| { type: "agent_settled"; activityToken: string };
+
+/** Awaited single-owner sink used by a managed host to persist correlated lifecycle barriers. */
+export type ManagedAgentSessionLifecycleSink = (
+	event: ManagedAgentSessionLifecycleEvent,
+	signal?: AbortSignal,
+) => Promise<void>;
 
 /** Result from cycleModel() */
 export interface ModelCycleResult {
@@ -315,6 +336,12 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private readonly _managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
+	private _managedPromptPreparationToken: string | undefined;
+	private _preparedManagedPrompt: { activityToken: string; messages: AgentMessage[] } | undefined;
+	private _activeManagedActivityToken: string | undefined;
+	private _managedSettlementPending = false;
+	private readonly _usedManagedActivityTokens = new Set<string>();
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -389,6 +416,7 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._managedLifecycleSink = config.managedLifecycleSink;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -584,7 +612,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -594,11 +622,20 @@ export class AgentSession {
 	}
 
 	private async _emitAgentSettled(): Promise<void> {
+		this._managedSettlementPending = this._managedLifecycleSink !== undefined;
 		this._isAgentRunActive = false;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
+			if (this._managedLifecycleSink) {
+				const activityToken = this._activeManagedActivityToken;
+				if (!activityToken) {
+					throw new Error("Managed agent_settled event has no active activity token");
+				}
+				await this._managedLifecycleSink({ type: "agent_settled", activityToken });
+			}
 			this._emit({ type: "agent_settled" });
 		} finally {
+			this._managedSettlementPending = false;
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -607,7 +644,15 @@ export class AgentSession {
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
+		if (this._managedLifecycleSink) {
+			const activityToken = this._activeManagedActivityToken;
+			if (!activityToken) {
+				throw new Error(`Managed ${event.type} event has no active activity token`);
+			}
+			await this._managedLifecycleSink({ type: "agent_event", activityToken, event }, signal);
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -881,7 +926,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this._managedSettlementPending;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1114,6 +1159,105 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._managedLifecycleSink) {
+			throw new Error("Managed lifecycle mode requires prepareManagedPrompt() followed by launchManagedPrompt()");
+		}
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt) {
+			throw new Error("A managed prompt is already preparing or waiting for launch");
+		}
+		const messages = await this._preparePrompt(text, options);
+		if (messages) {
+			await this._runAgentPrompt(messages);
+		}
+	}
+
+	/**
+	 * Run prompt preflight without starting Agent/provider execution.
+	 * The caller must durably commit its start barrier before calling launchManagedPrompt().
+	 */
+	async prepareManagedPrompt(
+		activityToken: string,
+		text: string,
+		options?: ManagedPromptOptions,
+	): Promise<ManagedPromptPreparation> {
+		if (!this._managedLifecycleSink) {
+			throw new Error("Managed prompt launch requires a managed lifecycle sink");
+		}
+		if (activityToken.trim().length === 0 || activityToken !== activityToken.trim()) {
+			throw new Error("Managed activity token must be a non-empty canonical string");
+		}
+		if (this.isStreaming || this._activeManagedActivityToken) {
+			throw new Error("A managed agent activity is already active");
+		}
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt) {
+			throw new Error("A managed prompt is already preparing or waiting for launch");
+		}
+		if (this._usedManagedActivityTokens.has(activityToken)) {
+			throw new Error(`Managed activity token ${activityToken} was already used`);
+		}
+		if (
+			this.agent.hasQueuedMessages() ||
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._pendingNextTurnMessages.length > 0
+		) {
+			throw new Error("Managed prompt preparation cannot adopt unmanaged queued messages");
+		}
+
+		this._usedManagedActivityTokens.add(activityToken);
+		this._managedPromptPreparationToken = activityToken;
+		try {
+			const messages = await this._preparePrompt(text, options, false);
+			if (!messages) {
+				return { outcome: "handled", activityToken };
+			}
+			this._preparedManagedPrompt = { activityToken, messages };
+			return { outcome: "ready", activityToken };
+		} finally {
+			this._managedPromptPreparationToken = undefined;
+		}
+	}
+
+	/** Start a previously prepared managed prompt with its stable activity token. */
+	async launchManagedPrompt(activityToken: string): Promise<void> {
+		const prepared = this._preparedManagedPrompt;
+		if (!prepared || prepared.activityToken !== activityToken) {
+			throw new Error(`No prepared managed prompt exists for activity token ${activityToken}`);
+		}
+		if (this.isStreaming || this._activeManagedActivityToken) {
+			throw new Error("A managed agent activity is already active");
+		}
+
+		this._preparedManagedPrompt = undefined;
+		this._activeManagedActivityToken = activityToken;
+		try {
+			await this._runAgentPrompt(prepared.messages);
+		} finally {
+			this._activeManagedActivityToken = undefined;
+		}
+	}
+
+	/** Cancel a prepared prompt before launch. Returns false for a stale or different token. */
+	cancelManagedPrompt(activityToken: string): boolean {
+		if (this._preparedManagedPrompt?.activityToken !== activityToken) {
+			return false;
+		}
+		this._preparedManagedPrompt = undefined;
+		this._systemPromptOverride = undefined;
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		return true;
+	}
+
+	/** Whether preflight has completed and a managed prompt is paused before launch. */
+	get hasPreparedManagedPrompt(): boolean {
+		return this._preparedManagedPrompt !== undefined;
+	}
+
+	private async _preparePrompt(
+		text: string,
+		options?: PromptOptions,
+		runPrePromptCompaction = true,
+	): Promise<AgentMessage[] | undefined> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1205,7 +1349,7 @@ export class AgentSession {
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
+			if (lastAssistant && runPrePromptCompaction) {
 				await this._checkCompaction(lastAssistant, false);
 			}
 
@@ -1269,7 +1413,7 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		return messages;
 	}
 
 	/**
