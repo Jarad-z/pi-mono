@@ -78,6 +78,7 @@ export interface HarnessOptions {
 	modelsJson?: Record<string, unknown>;
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
+	sessionManager?: SessionManager;
 }
 
 export interface Harness {
@@ -115,7 +116,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();

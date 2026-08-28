@@ -17,6 +17,7 @@ import { readdir, stat } from "fs/promises";
 import { join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
+import { isDeepStrictEqual } from "util";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
@@ -151,6 +152,53 @@ export type SessionEntry =
 	| CustomMessageEntry
 	| LabelEntry
 	| SessionInfoEntry;
+
+/** Session entry payload before the managed store assigns/validates durable tree identity. */
+export type ManagedSessionEntryDraft = {
+	[K in SessionEntry["type"]]: Omit<Extract<SessionEntry, { type: K }>, "id" | "parentId" | "timestamp">;
+}[SessionEntry["type"]];
+
+/** Authoritative snapshot used to hydrate a managed, non-JSONL SessionManager projection. */
+export interface ManagedSessionStoreSnapshot {
+	header: SessionHeader;
+	entries: readonly SessionEntry[];
+	leafId: string | null;
+}
+
+export interface ManagedSessionEntryReservationRequest {
+	sessionId: string;
+	parentId: string | null;
+	type: SessionEntry["type"];
+}
+
+export interface ManagedSessionEntryReservation {
+	entryId: string;
+}
+
+export interface ManagedSessionEntryAppendRequest {
+	sessionId: string;
+	expectedLeafId: string | null;
+	entry: SessionEntry;
+}
+
+export interface ManagedSessionLeafCasRequest {
+	sessionId: string;
+	expectedLeafId: string | null;
+	nextLeafId: string | null;
+}
+
+/**
+ * Awaited durable SessionStore boundary for managed mode.
+ *
+ * Implementations own durable entry identity and branch-head CAS. appendEntry()
+ * must be idempotent for an identical entry ID and reject conflicting replay.
+ */
+export interface ManagedSessionStore {
+	loadSnapshot(): Promise<ManagedSessionStoreSnapshot>;
+	reserveEntry(request: ManagedSessionEntryReservationRequest): Promise<ManagedSessionEntryReservation>;
+	appendEntry(request: ManagedSessionEntryAppendRequest): Promise<SessionEntry>;
+	compareAndSetLeaf(request: ManagedSessionLeafCasRequest): Promise<void>;
+}
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -864,6 +912,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private managedStore: ManagedSessionStore | undefined;
 
 	private constructor(
 		cwd: string,
@@ -889,6 +938,7 @@ export class SessionManager {
 
 	/** Switch to a different session file (used for resume and branching) */
 	setSessionFile(sessionFile: string): void {
+		this._assertLegacyMutation("setSessionFile");
 		this._setSessionFile(sessionFile);
 	}
 
@@ -928,6 +978,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		this._assertLegacyMutation("newSession");
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -992,6 +1043,11 @@ export class SessionManager {
 		return this.persist;
 	}
 
+	/** True when SQLite/another host store is the only durable session truth. */
+	isManaged(): boolean {
+		return this.managedStore !== undefined;
+	}
+
 	getCwd(): string {
 		return this.cwd;
 	}
@@ -1042,10 +1098,188 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		this._assertLegacyMutation("synchronous append");
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+	}
+
+	private _assertLegacyMutation(operation: string): void {
+		if (this.managedStore) {
+			throw new Error(`Managed SessionStore requires awaited ${operation}`);
+		}
+	}
+
+	private _requireManagedStore(): ManagedSessionStore {
+		if (!this.managedStore) {
+			throw new Error("Managed SessionStore is not configured");
+		}
+		return this.managedStore;
+	}
+
+	private async _appendManagedDraft(
+		draft: ManagedSessionEntryDraft,
+		options: {
+			reservedEntryId?: string;
+			parentId?: string | null;
+			expectedLeafId?: string | null;
+		} = {},
+	): Promise<string> {
+		const store = this._requireManagedStore();
+		const parentId = options.parentId === undefined ? this.leafId : options.parentId;
+		const expectedLeafId = options.expectedLeafId === undefined ? this.leafId : options.expectedLeafId;
+		if (parentId !== null && !this.byId.has(parentId)) {
+			throw new Error(`Entry ${parentId} not found`);
+		}
+		let entryId = options.reservedEntryId;
+		if (entryId === undefined) {
+			const reservation = await store.reserveEntry({
+				sessionId: this.sessionId,
+				parentId,
+				type: draft.type,
+			});
+			entryId = reservation.entryId;
+		}
+		if (entryId.trim().length === 0 || entryId !== entryId.trim()) {
+			throw new Error("Managed SessionStore returned an invalid reserved Entry ID");
+		}
+		const existing = this.byId.get(entryId);
+		if (existing) {
+			throw new Error(`Managed reserved Entry ID ${entryId} already exists in the session projection`);
+		}
+
+		const proposedEntry = {
+			...draft,
+			id: entryId,
+			parentId,
+			timestamp: new Date().toISOString(),
+		} as SessionEntry;
+		const entry = await store.appendEntry({ sessionId: this.sessionId, expectedLeafId, entry: proposedEntry });
+		const { id: committedId, parentId: committedParentId, timestamp, ...committedDraft } = entry;
+		if (
+			committedId !== entryId ||
+			committedParentId !== parentId ||
+			timestamp.trim().length === 0 ||
+			!isDeepStrictEqual(committedDraft, draft)
+		) {
+			throw new Error(`Managed SessionStore returned conflicting Entry ${entryId}`);
+		}
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this.leafId = entry.id;
+		if (entry.type === "label") {
+			if (entry.label) {
+				this.labelsById.set(entry.targetId, entry.label);
+				this.labelTimestampsById.set(entry.targetId, entry.timestamp);
+			} else {
+				this.labelsById.delete(entry.targetId);
+				this.labelTimestampsById.delete(entry.targetId);
+			}
+		}
+		return entry.id;
+	}
+
+	/** Append a message through the awaited managed store, optionally consuming a pre-reserved Entry ID. */
+	async appendManagedMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		reservedEntryId?: string,
+	): Promise<string> {
+		return this._appendManagedDraft({ type: "message", message }, { reservedEntryId });
+	}
+
+	async appendManagedThinkingLevelChange(thinkingLevel: string, reservedEntryId?: string): Promise<string> {
+		return this._appendManagedDraft({ type: "thinking_level_change", thinkingLevel }, { reservedEntryId });
+	}
+
+	async appendManagedModelChange(provider: string, modelId: string, reservedEntryId?: string): Promise<string> {
+		return this._appendManagedDraft({ type: "model_change", provider, modelId }, { reservedEntryId });
+	}
+
+	async appendManagedCompaction<T = unknown>(
+		summary: string,
+		firstKeptEntryId: string,
+		tokensBefore: number,
+		details?: T,
+		fromHook?: boolean,
+		usage?: Usage,
+		reservedEntryId?: string,
+	): Promise<string> {
+		return this._appendManagedDraft(
+			{ type: "compaction", summary, firstKeptEntryId, tokensBefore, details, usage, fromHook },
+			{ reservedEntryId },
+		);
+	}
+
+	async appendManagedCustomEntry(customType: string, data?: unknown, reservedEntryId?: string): Promise<string> {
+		return this._appendManagedDraft({ type: "custom", customType, data }, { reservedEntryId });
+	}
+
+	async appendManagedSessionInfo(name: string, reservedEntryId?: string): Promise<string> {
+		const sanitizedName = name.replace(/[\r\n]+/g, " ").trim();
+		return this._appendManagedDraft({ type: "session_info", name: sanitizedName }, { reservedEntryId });
+	}
+
+	async appendManagedCustomMessageEntry<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+		reservedEntryId?: string,
+	): Promise<string> {
+		return this._appendManagedDraft(
+			{ type: "custom_message", customType, content, display, details },
+			{ reservedEntryId },
+		);
+	}
+
+	async appendManagedLabelChange(
+		targetId: string,
+		label: string | undefined,
+		reservedEntryId?: string,
+	): Promise<string> {
+		if (!this.byId.has(targetId)) {
+			throw new Error(`Entry ${targetId} not found`);
+		}
+		return this._appendManagedDraft({ type: "label", targetId, label }, { reservedEntryId });
+	}
+
+	/** Atomically move the authoritative managed branch head and update the local projection. */
+	async compareAndSetManagedLeaf(expectedLeafId: string | null, nextLeafId: string | null): Promise<void> {
+		const store = this._requireManagedStore();
+		if (this.leafId !== expectedLeafId) {
+			throw new Error("Managed SessionStore local leaf changed before CAS");
+		}
+		if (nextLeafId !== null && !this.byId.has(nextLeafId)) {
+			throw new Error(`Entry ${nextLeafId} not found`);
+		}
+		await store.compareAndSetLeaf({ sessionId: this.sessionId, expectedLeafId, nextLeafId });
+		this.leafId = nextLeafId;
+	}
+
+	/** Atomically move to a branch point and append a durable branch summary. */
+	async appendManagedBranchSummary(
+		branchFromId: string | null,
+		summary: string,
+		details?: unknown,
+		fromHook?: boolean,
+		usage?: Usage,
+		reservedEntryId?: string,
+	): Promise<string> {
+		if (branchFromId !== null && !this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		return this._appendManagedDraft(
+			{
+				type: "branch_summary",
+				fromId: branchFromId ?? "root",
+				summary,
+				details,
+				usage,
+				fromHook,
+			},
+			{ reservedEntryId, parentId: branchFromId, expectedLeafId: this.leafId },
+		);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1358,6 +1592,7 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		this._assertLegacyMutation("branch");
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1370,6 +1605,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this._assertLegacyMutation("resetLeaf");
 		this.leafId = null;
 	}
 
@@ -1385,6 +1621,7 @@ export class SessionManager {
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
+		this._assertLegacyMutation("branchWithSummary");
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1410,6 +1647,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		this._assertLegacyMutation("createBranchedSession");
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -1562,6 +1800,42 @@ export class SessionManager {
 			return new SessionManager(cwd, dir, mostRecent, true);
 		}
 		return new SessionManager(cwd, dir, undefined, true);
+	}
+
+	/**
+	 * Hydrate a SessionManager projection from an authoritative managed store.
+	 * No JSONL file is opened or written in this mode.
+	 */
+	static async managed(store: ManagedSessionStore, cwdOverride?: string): Promise<SessionManager> {
+		const snapshot = await store.loadSnapshot();
+		if (snapshot.header.type !== "session") {
+			throw new Error("Managed SessionStore snapshot has no session header");
+		}
+		assertValidSessionId(snapshot.header.id);
+		const ids = new Set<string>();
+		for (const entry of snapshot.entries) {
+			if (entry.id.trim().length === 0 || entry.id !== entry.id.trim() || ids.has(entry.id)) {
+				throw new Error(`Managed SessionStore snapshot has invalid Entry ID ${entry.id}`);
+			}
+			ids.add(entry.id);
+		}
+		for (const entry of snapshot.entries) {
+			if (entry.parentId !== null && !ids.has(entry.parentId)) {
+				throw new Error(`Managed SessionStore snapshot Entry ${entry.id} has missing parent ${entry.parentId}`);
+			}
+		}
+		if (snapshot.leafId !== null && !ids.has(snapshot.leafId)) {
+			throw new Error(`Managed SessionStore snapshot has missing leaf ${snapshot.leafId}`);
+		}
+
+		const cwd = cwdOverride ?? snapshot.header.cwd ?? process.cwd();
+		const manager = new SessionManager(cwd, "", undefined, false, { id: snapshot.header.id });
+		manager.sessionId = snapshot.header.id;
+		manager.fileEntries = [snapshot.header, ...snapshot.entries];
+		manager.managedStore = store;
+		manager._buildIndex();
+		manager.leafId = snapshot.leafId;
+		return manager;
 	}
 
 	/** Create an in-memory session (no file persistence) */

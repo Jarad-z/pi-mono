@@ -100,7 +100,7 @@ export interface ManagedQueueSelectedItem {
 
 /** Per-item outcome returned by the managed host materialization barrier. */
 export type ManagedQueueMaterializationDecision =
-	| { type: "materialized"; itemId: string; message: AgentMessage }
+	| { type: "materialized"; itemId: string; message: AgentMessage; reservedEntryId?: string }
 	| { type: "drop_cancelled"; itemId: string };
 
 /**

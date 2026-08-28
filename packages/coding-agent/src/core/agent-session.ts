@@ -264,7 +264,10 @@ export interface PromptOptions {
 }
 
 /** Prompt options accepted by the managed paused-launch API. */
-export type ManagedPromptOptions = Omit<PromptOptions, "streamingBehavior" | "preflightResult">;
+export type ManagedPromptOptions = Omit<PromptOptions, "streamingBehavior" | "preflightResult"> & {
+	/** Host-reserved Entry identity for the transformed initial user message. */
+	reservedEntryId?: string;
+};
 
 /** Result of managed prompt preflight before provider-visible execution is allowed to start. */
 export type ManagedPromptPreparation =
@@ -443,6 +446,12 @@ export class AgentSession {
 		}
 		if (config.managedQueueMaterializationHook) {
 			this.agent.managedQueueMaterializationHook = config.managedQueueMaterializationHook;
+		}
+		if (
+			this.sessionManager.isManaged() &&
+			(!config.managedLifecycleSink || !this.agent.managedQueueMaterializationHook)
+		) {
+			throw new Error("Managed SessionStore requires lifecycle and queue materialization hooks");
 		}
 
 		// Always subscribe to agent events for internal handling
@@ -670,6 +679,43 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
+	private async _persistSessionMessage(message: AgentMessage): Promise<void> {
+		const reservedEntryId = this.agent.takeManagedMessageEntryReservation(message);
+		if (this.sessionManager.isManaged() && message.role === "user" && !reservedEntryId) {
+			throw new Error("Managed user message has no host-reserved Entry identity");
+		}
+		if (message.role === "custom") {
+			if (this.sessionManager.isManaged()) {
+				await this.sessionManager.appendManagedCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+					reservedEntryId,
+				);
+			} else {
+				this.sessionManager.appendCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+				);
+			}
+			return;
+		}
+		if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+			if (this.sessionManager.isManaged()) {
+				await this.sessionManager.appendManagedMessage(message, reservedEntryId);
+			} else {
+				this.sessionManager.appendMessage(message);
+			}
+			return;
+		}
+		if (reservedEntryId) {
+			throw new Error(`Managed Entry reservation cannot be applied to message role ${message.role}`);
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
 		if (this._managedLifecycleSink) {
@@ -704,28 +750,17 @@ export class AgentSession {
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
+		if (event.type === "message_end" && this.sessionManager.isManaged()) {
+			await this._persistSessionMessage(event.message);
+		}
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		// Handle session persistence
 		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+			if (!this.sessionManager.isManaged()) {
+				await this._persistSessionMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -1239,6 +1274,17 @@ export class AgentSession {
 			if (!messages) {
 				return { outcome: "handled", activityToken };
 			}
+			if (this.sessionManager.isManaged()) {
+				if (!options?.reservedEntryId) {
+					throw new Error("Managed prompt requires a host-reserved initial Entry identity");
+				}
+				if (messages.length !== 1 || messages[0]?.role !== "user") {
+					throw new Error(
+						"Managed prompt cannot accept extension-injected messages without reserved Entry identities",
+					);
+				}
+				this.agent.registerManagedMessageEntryReservation(messages[0], options.reservedEntryId);
+			}
 			this._preparedManagedPrompt = { activityToken, messages };
 			return { outcome: "ready", activityToken };
 		} finally {
@@ -1678,13 +1724,22 @@ export class AgentSession {
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
 		} else {
+			if (this.sessionManager.isManaged()) {
+				await this.sessionManager.appendManagedCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+				);
+			} else {
+				this.sessionManager.appendCustomMessageEntry(
+					message.customType,
+					message.content,
+					message.display,
+					message.details,
+				);
+			}
 			this.agent.state.messages.push(appMessage);
-			this.sessionManager.appendCustomMessageEntry(
-				message.customType,
-				message.content,
-				message.display,
-				message.details,
-			);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
 		}
@@ -1813,12 +1868,20 @@ export class AgentSession {
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		if (this.sessionManager.isManaged()) {
+			await this.sessionManager.appendManagedModelChange(model.provider, model.id);
+		} else {
+			this.sessionManager.appendModelChange(model.provider, model.id);
+		}
 		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
+		if (this.sessionManager.isManaged()) {
+			await this.setManagedThinkingLevel(thinkingLevel);
+		} else {
+			this.setThinkingLevel(thinkingLevel);
+		}
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -1855,15 +1918,23 @@ export class AgentSession {
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
 
 		// Apply model
+		if (this.sessionManager.isManaged()) {
+			await this.sessionManager.appendManagedModelChange(next.model.provider, next.model.id);
+		} else {
+			this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+		}
 		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
 		this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
 
 		// Apply thinking level.
 		// - Explicit scoped model thinking level overrides current session level
 		// - Undefined scoped model thinking level inherits the current session preference
 		// setThinkingLevel clamps to model capabilities.
-		this.setThinkingLevel(thinkingLevel);
+		if (this.sessionManager.isManaged()) {
+			await this.setManagedThinkingLevel(thinkingLevel);
+		} else {
+			this.setThinkingLevel(thinkingLevel);
+		}
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
@@ -1883,12 +1954,20 @@ export class AgentSession {
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		if (this.sessionManager.isManaged()) {
+			await this.sessionManager.appendManagedModelChange(nextModel.provider, nextModel.id);
+		} else {
+			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+		}
 		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
-		this.setThinkingLevel(thinkingLevel);
+		if (this.sessionManager.isManaged()) {
+			await this.setManagedThinkingLevel(thinkingLevel);
+		} else {
+			this.setThinkingLevel(thinkingLevel);
+		}
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
@@ -1905,6 +1984,9 @@ export class AgentSession {
 	 * Saves to session and settings only if the level actually changes.
 	 */
 	setThinkingLevel(level: ThinkingLevel): void {
+		if (this.sessionManager.isManaged()) {
+			throw new Error("Managed SessionStore requires awaited setManagedThinkingLevel()");
+		}
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -1926,6 +2008,29 @@ export class AgentSession {
 				previousLevel,
 			});
 		}
+	}
+
+	/** Managed equivalent of setThinkingLevel with durable append before visible state mutation. */
+	async setManagedThinkingLevel(level: ThinkingLevel): Promise<void> {
+		if (!this.sessionManager.isManaged()) {
+			throw new Error("setManagedThinkingLevel() requires a managed SessionStore");
+		}
+		const availableLevels = this.getAvailableThinkingLevels();
+		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+		const previousLevel = this.agent.state.thinkingLevel;
+		if (effectiveLevel === previousLevel) return;
+
+		await this.sessionManager.appendManagedThinkingLevelChange(effectiveLevel);
+		this.agent.state.thinkingLevel = effectiveLevel;
+		if (this.supportsThinking() || effectiveLevel !== "off") {
+			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+		}
+		this._emit({ type: "thinking_level_changed", level: effectiveLevel });
+		await this._extensionRunner.emit({
+			type: "thinking_level_select",
+			level: effectiveLevel,
+			previousLevel,
+		});
 	}
 
 	/**
@@ -2098,7 +2203,25 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			if (this.sessionManager.isManaged()) {
+				await this.sessionManager.appendManagedCompaction(
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					usage,
+				);
+			} else {
+				this.sessionManager.appendCompaction(
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					usage,
+				);
+			}
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -2377,7 +2500,25 @@ export class AgentSession {
 				return false;
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			if (this.sessionManager.isManaged()) {
+				await this.sessionManager.appendManagedCompaction(
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					usage,
+				);
+			} else {
+				this.sessionManager.appendCompaction(
+					summary,
+					firstKeptEntryId,
+					tokensBefore,
+					details,
+					fromExtension,
+					usage,
+				);
+			}
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -3034,6 +3175,9 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		if (this.sessionManager.isManaged()) {
+			throw new Error("Managed SessionStore requires bash execution to use a managed ActivityScope");
+		}
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -3084,6 +3228,9 @@ export class AgentSession {
 	 */
 	private _flushPendingBashMessages(): void {
 		if (this._pendingBashMessages.length === 0) return;
+		if (this.sessionManager.isManaged()) {
+			throw new Error("Managed SessionStore cannot flush unscoped bash messages");
+		}
 
 		for (const bashMessage of this._pendingBashMessages) {
 			// Add to agent state
@@ -3104,10 +3251,23 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		if (this.sessionManager.isManaged()) {
+			throw new Error("Managed SessionStore requires awaited setManagedSessionName()");
+		}
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
 		void this._extensionRunner.emit(event);
+	}
+
+	async setManagedSessionName(name: string): Promise<void> {
+		if (!this.sessionManager.isManaged()) {
+			throw new Error("setManagedSessionName() requires a managed SessionStore");
+		}
+		await this.sessionManager.appendManagedSessionInfo(name);
+		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
+		this._emit(event);
+		await this._extensionRunner.emit(event);
 	}
 
 	// =========================================================================
@@ -3270,19 +3430,33 @@ export class AgentSession {
 			let summaryEntry: BranchSummaryEntry | undefined;
 			if (summaryText) {
 				// Create summary at target position (can be null for root)
-				const summaryId = this.sessionManager.branchWithSummary(
-					newLeafId,
-					summaryText,
-					summaryDetails,
-					fromExtension,
-					summaryUsage,
-				);
+				const summaryId = this.sessionManager.isManaged()
+					? await this.sessionManager.appendManagedBranchSummary(
+							newLeafId,
+							summaryText,
+							summaryDetails,
+							fromExtension,
+							summaryUsage,
+						)
+					: this.sessionManager.branchWithSummary(
+							newLeafId,
+							summaryText,
+							summaryDetails,
+							fromExtension,
+							summaryUsage,
+						);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
 				// Attach label to the summary entry
 				if (label) {
-					this.sessionManager.appendLabelChange(summaryId, label);
+					if (this.sessionManager.isManaged()) {
+						await this.sessionManager.appendManagedLabelChange(summaryId, label);
+					} else {
+						this.sessionManager.appendLabelChange(summaryId, label);
+					}
 				}
+			} else if (this.sessionManager.isManaged()) {
+				await this.sessionManager.compareAndSetManagedLeaf(this.sessionManager.getLeafId(), newLeafId);
 			} else if (newLeafId === null) {
 				// No summary, navigating to root - reset leaf
 				this.sessionManager.resetLeaf();
@@ -3293,7 +3467,11 @@ export class AgentSession {
 
 			// Attach label to target entry when not summarizing (no summary entry to label)
 			if (label && !summaryText) {
-				this.sessionManager.appendLabelChange(targetId, label);
+				if (this.sessionManager.isManaged()) {
+					await this.sessionManager.appendManagedLabelChange(targetId, label);
+				} else {
+					this.sessionManager.appendLabelChange(targetId, label);
+				}
 			}
 
 			// Update agent state

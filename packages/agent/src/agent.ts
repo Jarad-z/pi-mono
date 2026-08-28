@@ -234,6 +234,7 @@ export class Agent {
 	private readonly followUpQueue: PendingMessageQueue;
 	private readonly managedQueueItems = new Map<string, ManagedPendingMessage>();
 	private readonly consumedManagedQueueItems = new Map<string, ManagedQueueTicket>();
+	private readonly managedMessageEntryReservations = new WeakMap<object, string>();
 	private managedQueueMirrorRevision = 0;
 	private managedQueueFailure: Error | undefined;
 
@@ -469,6 +470,33 @@ export class Agent {
 			mirrorRevision: item.mirrorRevision,
 			phase: item.phase,
 		}));
+	}
+
+	/** Attach a host-reserved durable Entry identity to an exact managed message object. */
+	registerManagedMessageEntryReservation(message: AgentMessage, reservedEntryId: string): void {
+		if (typeof message !== "object" || message === null) {
+			throw new Error("Managed message Entry reservation requires an object message");
+		}
+		if (reservedEntryId.trim().length === 0 || reservedEntryId !== reservedEntryId.trim()) {
+			throw new Error("Managed reserved Entry ID must be a non-empty canonical string");
+		}
+		const existing = this.managedMessageEntryReservations.get(message);
+		if (existing && existing !== reservedEntryId) {
+			throw new Error("Managed message already has a different reserved Entry identity");
+		}
+		this.managedMessageEntryReservations.set(message, reservedEntryId);
+	}
+
+	/** Consume the exact-message Entry reservation at the awaited persistence barrier. */
+	takeManagedMessageEntryReservation(message: AgentMessage): string | undefined {
+		if (typeof message !== "object" || message === null) {
+			return undefined;
+		}
+		const reservedEntryId = this.managedMessageEntryReservations.get(message);
+		if (reservedEntryId) {
+			this.managedMessageEntryReservations.delete(message);
+		}
+		return reservedEntryId;
 	}
 
 	private assertLegacyQueueAccess(): void {
@@ -768,6 +796,9 @@ export class Agent {
 			}
 			this.managedQueueItems.delete(item.itemId);
 			if (decision.type === "materialized") {
+				if (decision.reservedEntryId) {
+					this.registerManagedMessageEntryReservation(decision.message, decision.reservedEntryId);
+				}
 				this.consumedManagedQueueItems.set(item.itemId, this.ticketFor(item));
 				messages.push(decision.message);
 			}

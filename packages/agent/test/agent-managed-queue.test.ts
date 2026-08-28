@@ -170,13 +170,19 @@ describe("Agent managed queue mirror", () => {
 		const selected = deferred();
 		const release = deferred();
 		const contexts: AgentMessage[][] = [];
+		let observedReservedEntryId: string | undefined;
 		let agent!: Agent;
 		agent = createAgent(
 			async (items, signal) => {
 				expect(signal).toBe(agent.signal);
 				selected.resolve();
 				await release.promise;
-				return items.map((item) => ({ type: "materialized", itemId: item.itemId, message: user("transformed") }));
+				return items.map((item) => ({
+					type: "materialized",
+					itemId: item.itemId,
+					message: user("transformed"),
+					reservedEntryId: "entry_input_1",
+				}));
 			},
 			{
 				streamFn: (_model, context) => {
@@ -185,6 +191,11 @@ describe("Agent managed queue mirror", () => {
 				},
 			},
 		);
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "user") {
+				observedReservedEntryId = agent.takeManagedMessageEntryReservation(event.message);
+			}
+		});
 		const staged = agent.stageManagedQueueItem({ itemId: "input_1", lane: "follow_up", message: user("raw") });
 		if (staged.type !== "staged") throw new Error("Expected staged ticket");
 		agent.admitManagedQueueItem(staged.ticket);
@@ -199,6 +210,7 @@ describe("Agent managed queue mirror", () => {
 		expect(contexts).toHaveLength(1);
 		expect(userTexts(contexts[0])).toContain("transformed");
 		expect(userTexts(contexts[0])).not.toContain("raw");
+		expect(observedReservedEntryId).toBe("entry_input_1");
 	});
 
 	it("fails the mirror closed when materialization rejects", async () => {

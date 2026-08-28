@@ -4,6 +4,15 @@ import type {
 	ManagedAgentSessionLifecycleEvent,
 	ManagedAgentSessionLifecycleSink,
 } from "../../src/core/agent-session.ts";
+import {
+	type ManagedSessionEntryAppendRequest,
+	type ManagedSessionEntryReservationRequest,
+	type ManagedSessionLeafCasRequest,
+	type ManagedSessionStore,
+	type ManagedSessionStoreSnapshot,
+	type SessionEntry,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -12,6 +21,50 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 		resolve = settle;
 	});
 	return { promise, resolve };
+}
+
+class ManagedLaunchSessionStore implements ManagedSessionStore {
+	readonly entries: SessionEntry[] = [];
+	readonly reserved = new Set<string>();
+	readonly order: string[] = [];
+	leafId: string | null = null;
+	nextId = 1;
+
+	async loadSnapshot(): Promise<ManagedSessionStoreSnapshot> {
+		return {
+			header: {
+				type: "session",
+				version: 3,
+				id: "managed_launch_session",
+				timestamp: "2026-08-28T00:00:00.000Z",
+				cwd: "D:/workspace",
+			},
+			entries: this.entries,
+			leafId: this.leafId,
+		};
+	}
+
+	async reserveEntry(request: ManagedSessionEntryReservationRequest): Promise<{ entryId: string }> {
+		expect(request.sessionId).toBe("managed_launch_session");
+		const entryId = `host_entry_${this.nextId++}`;
+		this.reserved.add(entryId);
+		return { entryId };
+	}
+
+	async appendEntry(request: ManagedSessionEntryAppendRequest): Promise<SessionEntry> {
+		if (request.expectedLeafId !== this.leafId || !this.reserved.delete(request.entry.id)) {
+			throw new Error("managed store append CAS failed");
+		}
+		this.entries.push(request.entry);
+		this.leafId = request.entry.id;
+		this.order.push(`store:${request.entry.type === "message" ? request.entry.message.role : request.entry.type}`);
+		return request.entry;
+	}
+
+	async compareAndSetLeaf(request: ManagedSessionLeafCasRequest): Promise<void> {
+		if (request.expectedLeafId !== this.leafId) throw new Error("managed store leaf CAS failed");
+		this.leafId = request.nextLeafId;
+	}
 }
 
 describe("AgentSession managed paused launch", () => {
@@ -196,5 +249,51 @@ describe("AgentSession managed paused launch", () => {
 		);
 		expect(harness.session.removeManagedQueueItem("input_1")).toBe("removed");
 		expect(harness.session.getManagedQueueMirrorSnapshot()).toEqual([]);
+	});
+
+	it("persists reserved managed entries before public message_end visibility", async () => {
+		const store = new ManagedLaunchSessionStore();
+		store.reserved.add("reserved_initial_entry");
+		const sessionManager = await SessionManager.managed(store);
+		const harness = await createHarness({
+			sessionManager,
+			managedLifecycleSink: async () => {},
+			managedQueueMaterializationHook: async (items) =>
+				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
+		});
+		harnesses.push(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "message_end") store.order.push(`public:${event.message.role}`);
+		});
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prepareManagedPrompt("activity_7", "hello", {
+			reservedEntryId: "reserved_initial_entry",
+		});
+		await harness.session.launchManagedPrompt("activity_7");
+
+		expect(store.entries.map((entry) => entry.id)).toEqual(["reserved_initial_entry", "host_entry_1"]);
+		expect(store.entries.map((entry) => entry.parentId)).toEqual([null, "reserved_initial_entry"]);
+		expect(store.order).toEqual(["store:user", "public:user", "store:assistant", "public:assistant"]);
+		expect(sessionManager.getEntries()).toEqual(store.entries);
+		expect(sessionManager.getSessionFile()).toBeUndefined();
+	});
+
+	it("rejects a managed initial prompt without a host-reserved Entry identity", async () => {
+		const store = new ManagedLaunchSessionStore();
+		const sessionManager = await SessionManager.managed(store);
+		const harness = await createHarness({
+			sessionManager,
+			managedLifecycleSink: async () => {},
+			managedQueueMaterializationHook: async (items) =>
+				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
+		});
+		harnesses.push(harness);
+
+		await expect(harness.session.prepareManagedPrompt("activity_8", "hello")).rejects.toThrow(
+			"host-reserved initial Entry identity",
+		);
+		expect(store.entries).toEqual([]);
+		expect(harness.session.hasPreparedManagedPrompt).toBe(false);
 	});
 });
