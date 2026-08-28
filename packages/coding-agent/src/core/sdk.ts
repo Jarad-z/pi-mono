@@ -3,7 +3,7 @@ import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, type AgentSessionConfig } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
@@ -84,6 +84,11 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Complete managed-host bridge. Must be paired with SessionManager.managed(). */
+	managedHost?: Pick<
+		AgentSessionConfig,
+		"managedLifecycleSink" | "managedQueueMaterializationHook" | "managedExtensionHost" | "managedFailStopSink"
+	>;
 }
 
 /** Result from createAgentSession */
@@ -179,6 +184,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	if (sessionManager.isManaged() !== (options.managedHost !== undefined)) {
+		throw new Error(
+			"Managed SDK creation requires SessionManager.managed() and managedHost to be installed together",
+		);
+	}
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -365,10 +375,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Restore messages if session has existing data
 	if (hasExistingSession) {
 		agent.state.messages = existingSession.messages;
-		if (!hasThinkingEntry) {
+		if (!hasThinkingEntry && !sessionManager.isManaged()) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
+	} else if (!sessionManager.isManaged()) {
 		// Save initial model and thinking level for new sessions so they can be restored on resume
 		if (model) {
 			sessionManager.appendModelChange(model.provider, model.id);
@@ -390,6 +400,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		...options.managedHost,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 
