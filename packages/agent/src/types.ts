@@ -49,6 +49,80 @@ export type ToolExecutionMode = "sequential" | "parallel";
  */
 export type QueueMode = "all" | "one-at-a-time";
 
+/** Managed queue lane whose delivery point matches the legacy steering/follow-up queues. */
+export type ManagedQueueLane = "steer" | "follow_up";
+
+/** Closed-world phase of a managed queue mirror item. */
+export type ManagedQueueItemPhase = "staged" | "admitted" | "published" | "selected" | "failed";
+
+/** Stable envelope staged into the managed in-memory queue mirror. */
+export interface ManagedQueueItemInput {
+	itemId: string;
+	lane: ManagedQueueLane;
+	message: AgentMessage;
+}
+
+/** Fenced ticket returned when a managed item is provisionally staged. */
+export interface ManagedQueueTicket {
+	itemId: string;
+	lane: ManagedQueueLane;
+	mirrorRevision: number;
+}
+
+/** Result of staging a stable managed queue item. */
+export type ManagedQueueStageResult =
+	| { type: "staged"; ticket: ManagedQueueTicket }
+	| { type: "duplicate"; ticket: ManagedQueueTicket; phase: ManagedQueueItemPhase };
+
+/** Result of acknowledging durable admission for a staged item. */
+export type ManagedQueueAdmissionResult = "admitted" | "already_admitted" | "stale";
+
+/** Result of publishing a durably admitted item to the drainable queue. */
+export type ManagedQueuePublishResult = "published" | "already_published" | "stale";
+
+/** Result of aborting a provisional admission ticket. */
+export type ManagedQueueAbortResult =
+	| "removed"
+	| "already_published"
+	| "already_selected"
+	| "already_consumed"
+	| "stale";
+
+/** Result of cancelling/removing an item before dequeue selection wins. */
+export type ManagedQueueRemovalResult = "removed" | "already_selected" | "already_consumed" | "not_found";
+
+/** Stable selected envelope passed to the awaited host materialization barrier. */
+export interface ManagedQueueSelectedItem {
+	readonly itemId: string;
+	readonly lane: ManagedQueueLane;
+	readonly message: AgentMessage;
+}
+
+/** Per-item outcome returned by the managed host materialization barrier. */
+export type ManagedQueueMaterializationDecision =
+	| { type: "materialized"; itemId: string; message: AgentMessage }
+	| { type: "drop_cancelled"; itemId: string };
+
+/**
+ * Awaited boundary between synchronous dequeue selection and Provider visibility.
+ *
+ * The host must return exactly one decision for every selected item. A rejected or
+ * malformed result fails the queue mirror closed and no selected message is returned
+ * to the agent loop.
+ */
+export type ManagedQueueMaterializationHook = (
+	items: readonly ManagedQueueSelectedItem[],
+	signal: AbortSignal,
+) => Promise<readonly ManagedQueueMaterializationDecision[]>;
+
+/** Read-only evidence for reconciliation and generation shutdown. */
+export interface ManagedQueueMirrorItemSnapshot {
+	readonly itemId: string;
+	readonly lane: ManagedQueueLane;
+	readonly mirrorRevision: number;
+	readonly phase: ManagedQueueItemPhase;
+}
+
 /** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 

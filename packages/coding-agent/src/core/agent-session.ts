@@ -21,6 +21,15 @@ import type {
 	AgentMessage,
 	AgentState,
 	AgentTool,
+	ManagedQueueAbortResult,
+	ManagedQueueAdmissionResult,
+	ManagedQueueItemInput,
+	ManagedQueueMaterializationHook,
+	ManagedQueueMirrorItemSnapshot,
+	ManagedQueuePublishResult,
+	ManagedQueueRemovalResult,
+	ManagedQueueStageResult,
+	ManagedQueueTicket,
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
@@ -227,6 +236,8 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	/** Optional managed-host lifecycle sink. Enabling it requires typed managed prompt launch. */
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
+	/** Awaited managed queue barrier installed together with the managed host bridge. */
+	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 }
 
 export interface ExtensionBindings {
@@ -417,6 +428,22 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._managedLifecycleSink = config.managedLifecycleSink;
+		if (config.managedQueueMaterializationHook && !config.managedLifecycleSink) {
+			throw new Error("Managed queue materialization requires a managed lifecycle sink");
+		}
+		if (config.managedQueueMaterializationHook && this.agent.hasQueuedMessages()) {
+			throw new Error("Managed queue materialization cannot adopt legacy queued messages");
+		}
+		if (
+			config.managedQueueMaterializationHook &&
+			this.agent.managedQueueMaterializationHook &&
+			this.agent.managedQueueMaterializationHook !== config.managedQueueMaterializationHook
+		) {
+			throw new Error("Agent already has a different managed queue materialization hook");
+		}
+		if (config.managedQueueMaterializationHook) {
+			this.agent.managedQueueMaterializationHook = config.managedQueueMaterializationHook;
+		}
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -1197,11 +1224,12 @@ export class AgentSession {
 		}
 		if (
 			this.agent.hasQueuedMessages() ||
+			this.agent.hasManagedQueueItems() ||
 			this._steeringMessages.length > 0 ||
 			this._followUpMessages.length > 0 ||
 			this._pendingNextTurnMessages.length > 0
 		) {
-			throw new Error("Managed prompt preparation cannot adopt unmanaged queued messages");
+			throw new Error("Managed prompt preparation cannot start while queued messages remain");
 		}
 
 		this._usedManagedActivityTokens.add(activityToken);
@@ -1251,6 +1279,48 @@ export class AgentSession {
 	/** Whether preflight has completed and a managed prompt is paused before launch. */
 	get hasPreparedManagedPrompt(): boolean {
 		return this._preparedManagedPrompt !== undefined;
+	}
+
+	/** Stage a stable managed queue item without making it drainable. */
+	stageManagedQueueItem(input: ManagedQueueItemInput): ManagedQueueStageResult {
+		this.assertManagedQueueBridge();
+		return this.agent.stageManagedQueueItem(input);
+	}
+
+	/** Acknowledge durable admission for a staged managed queue item. */
+	admitManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueueAdmissionResult {
+		this.assertManagedQueueBridge();
+		return this.agent.admitManagedQueueItem(ticket);
+	}
+
+	/** Publish a durably admitted managed queue item to its delivery lane. */
+	publishManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueuePublishResult {
+		this.assertManagedQueueBridge();
+		return this.agent.publishManagedQueueItem(ticket);
+	}
+
+	/** Abort a staged/admitted managed queue ticket. */
+	abortManagedQueueItem(ticket: ManagedQueueTicket): ManagedQueueAbortResult {
+		this.assertManagedQueueBridge();
+		return this.agent.abortManagedQueueItem(ticket);
+	}
+
+	/** Remove a managed item unless dequeue selection has already won. */
+	removeManagedQueueItem(itemId: string): ManagedQueueRemovalResult {
+		this.assertManagedQueueBridge();
+		return this.agent.removeManagedQueueItem(itemId);
+	}
+
+	/** Snapshot managed mirror evidence for reconciliation and queue-gate close. */
+	getManagedQueueMirrorSnapshot(): readonly ManagedQueueMirrorItemSnapshot[] {
+		this.assertManagedQueueBridge();
+		return this.agent.getManagedQueueMirrorSnapshot();
+	}
+
+	private assertManagedQueueBridge(): void {
+		if (!this._managedLifecycleSink || !this.agent.managedQueueMaterializationHook) {
+			throw new Error("Managed queue APIs require lifecycle and materialization hooks");
+		}
 	}
 
 	private async _preparePrompt(
@@ -1485,6 +1555,9 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		if (this.agent.managedQueueMaterializationHook) {
+			throw new Error("Managed queue mode requires stageManagedQueueItem() admission");
+		}
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1505,6 +1578,9 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+		if (this.agent.managedQueueMaterializationHook) {
+			throw new Error("Managed queue mode requires stageManagedQueueItem() admission");
+		}
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1660,6 +1736,9 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
+		if (this.agent.managedQueueMaterializationHook) {
+			throw new Error("Managed queue mode requires per-item removeManagedQueueItem() cancellation");
+		}
 		const steering = [...this._steeringMessages];
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];

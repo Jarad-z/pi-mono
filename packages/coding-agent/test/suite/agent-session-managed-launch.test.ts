@@ -162,4 +162,39 @@ describe("AgentSession managed paused launch", () => {
 			"Managed lifecycle mode requires prepareManagedPrompt() followed by launchManagedPrompt()",
 		);
 	});
+
+	it("bridges stable managed queue admission and rejects legacy queue mutation", async () => {
+		const harness = await createHarness({
+			managedLifecycleSink: async () => {},
+			managedQueueMaterializationHook: async (items) =>
+				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
+		});
+		harnesses.push(harness);
+		const staged = harness.session.stageManagedQueueItem({
+			itemId: "input_1",
+			lane: "steer",
+			message: { role: "user", content: [{ type: "text", text: "queued" }], timestamp: Date.now() },
+		});
+		expect(staged.type).toBe("staged");
+		if (staged.type !== "staged") throw new Error("Expected staged ticket");
+
+		expect(harness.session.admitManagedQueueItem(staged.ticket)).toBe("admitted");
+		expect(harness.session.publishManagedQueueItem(staged.ticket)).toBe("published");
+		expect(harness.session.getManagedQueueMirrorSnapshot()).toEqual([
+			{
+				itemId: "input_1",
+				lane: "steer",
+				mirrorRevision: staged.ticket.mirrorRevision,
+				phase: "published",
+			},
+		]);
+		await expect(harness.session.steer("legacy")).rejects.toThrow("stageManagedQueueItem() admission");
+		await expect(harness.session.followUp("legacy")).rejects.toThrow("stageManagedQueueItem() admission");
+		expect(() => harness.session.clearQueue()).toThrow("per-item removeManagedQueueItem() cancellation");
+		await expect(harness.session.prepareManagedPrompt("activity_6", "new activity")).rejects.toThrow(
+			"cannot start while queued messages remain",
+		);
+		expect(harness.session.removeManagedQueueItem("input_1")).toBe("removed");
+		expect(harness.session.getManagedQueueMirrorSnapshot()).toEqual([]);
+	});
 });

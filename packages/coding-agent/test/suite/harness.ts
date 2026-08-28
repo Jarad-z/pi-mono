@@ -6,7 +6,7 @@ import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } fro
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, ManagedQueueMaterializationHook } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type {
 	FauxModelDefinition,
@@ -77,6 +77,7 @@ export interface HarnessOptions {
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
+	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 }
 
 export interface Harness {
@@ -197,6 +198,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
 		managedLifecycleSink: options.managedLifecycleSink,
+		managedQueueMaterializationHook: options.managedQueueMaterializationHook,
 	});
 
 	const events: AgentSessionEvent[] = [];
