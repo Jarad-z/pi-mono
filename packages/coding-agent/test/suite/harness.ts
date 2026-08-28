@@ -21,7 +21,7 @@ import {
 	type ManagedAgentSessionLifecycleSink,
 } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import type { ExtensionRunner } from "../../src/core/extensions/index.ts";
+import type { ExtensionRunner, ManagedExtensionHost } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
@@ -78,6 +78,7 @@ export interface HarnessOptions {
 	modelsJson?: Record<string, unknown>;
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
+	managedExtensionHost?: ManagedExtensionHost;
 	sessionManager?: SessionManager;
 }
 
@@ -200,6 +201,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		extensionRunnerRef,
 		managedLifecycleSink: options.managedLifecycleSink,
 		managedQueueMaterializationHook: options.managedQueueMaterializationHook,
+		managedExtensionHost: options.managedExtensionHost,
 	});
 
 	const events: AgentSessionEvent[] = [];

@@ -4,6 +4,7 @@ import type {
 	ManagedAgentSessionLifecycleEvent,
 	ManagedAgentSessionLifecycleSink,
 } from "../../src/core/agent-session.ts";
+import type { ManagedExtensionHost } from "../../src/core/extensions/index.ts";
 import {
 	type ManagedSessionEntryAppendRequest,
 	type ManagedSessionEntryReservationRequest,
@@ -21,6 +22,20 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 		resolve = settle;
 	});
 	return { promise, resolve };
+}
+
+function managedExtensionHost(activityToken: string): ManagedExtensionHost {
+	return {
+		getActivityBinding: () => ({
+			generationId: "generation_1",
+			generationLeaseToken: "lease_1",
+			activityToken,
+			runId: "run_1",
+			coreInvocationId: "core_1",
+		}),
+		dispatchExtensionAction: async (_request, execute) => execute(),
+		executeTool: async (_scope, execute) => execute(),
+	};
 }
 
 class ManagedLaunchSessionStore implements ManagedSessionStore {
@@ -81,7 +96,10 @@ describe("AgentSession managed paused launch", () => {
 		const sink: ManagedAgentSessionLifecycleSink = async (event) => {
 			lifecycle.push(event);
 		};
-		const harness = await createHarness({ managedLifecycleSink: sink });
+		const harness = await createHarness({
+			managedLifecycleSink: sink,
+			managedExtensionHost: managedExtensionHost("activity_1"),
+		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 
@@ -116,7 +134,10 @@ describe("AgentSession managed paused launch", () => {
 				await releaseStart.promise;
 			}
 		};
-		const harness = await createHarness({ managedLifecycleSink: sink });
+		const harness = await createHarness({
+			managedLifecycleSink: sink,
+			managedExtensionHost: managedExtensionHost("activity_2"),
+		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		await harness.session.prepareManagedPrompt("activity_2", "hello");
@@ -140,7 +161,10 @@ describe("AgentSession managed paused launch", () => {
 				await releaseSettlement.promise;
 			}
 		};
-		const harness = await createHarness({ managedLifecycleSink: sink });
+		const harness = await createHarness({
+			managedLifecycleSink: sink,
+			managedExtensionHost: managedExtensionHost("activity_3"),
+		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		await harness.session.prepareManagedPrompt("activity_3", "hello");
@@ -165,7 +189,10 @@ describe("AgentSession managed paused launch", () => {
 	});
 
 	it("cancels only the matching prepared token and never permits token reuse", async () => {
-		const harness = await createHarness({ managedLifecycleSink: async () => {} });
+		const harness = await createHarness({
+			managedLifecycleSink: async () => {},
+			managedExtensionHost: managedExtensionHost("activity_4"),
+		});
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("unused")]);
 		await harness.session.prepareManagedPrompt("activity_4", "hello");
@@ -185,6 +212,7 @@ describe("AgentSession managed paused launch", () => {
 			managedLifecycleSink: async (event) => {
 				lifecycle.push(event);
 			},
+			managedExtensionHost: managedExtensionHost("activity_5"),
 			extensionFactories: [
 				(pi) => {
 					pi.registerCommand("managed", {
@@ -208,7 +236,10 @@ describe("AgentSession managed paused launch", () => {
 	});
 
 	it("rejects legacy prompt entry while the managed lifecycle sink owns the session", async () => {
-		const harness = await createHarness({ managedLifecycleSink: async () => {} });
+		const harness = await createHarness({
+			managedLifecycleSink: async () => {},
+			managedExtensionHost: managedExtensionHost("unused"),
+		});
 		harnesses.push(harness);
 
 		await expect(harness.session.prompt("legacy")).rejects.toThrow(
@@ -219,6 +250,7 @@ describe("AgentSession managed paused launch", () => {
 	it("bridges stable managed queue admission and rejects legacy queue mutation", async () => {
 		const harness = await createHarness({
 			managedLifecycleSink: async () => {},
+			managedExtensionHost: managedExtensionHost("activity_6"),
 			managedQueueMaterializationHook: async (items) =>
 				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
 		});
@@ -258,6 +290,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			sessionManager,
 			managedLifecycleSink: async () => {},
+			managedExtensionHost: managedExtensionHost("activity_7"),
 			managedQueueMaterializationHook: async (items) =>
 				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
 		});
@@ -285,6 +318,7 @@ describe("AgentSession managed paused launch", () => {
 		const harness = await createHarness({
 			sessionManager,
 			managedLifecycleSink: async () => {},
+			managedExtensionHost: managedExtensionHost("activity_8"),
 			managedQueueMaterializationHook: async (items) =>
 				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
 		});

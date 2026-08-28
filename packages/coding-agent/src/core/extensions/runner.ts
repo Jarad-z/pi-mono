@@ -2,15 +2,16 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model, Provider, ProviderHeaders } from "@earendil-works/pi-ai";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { Api, ImageContent, Model, Provider, ProviderHeaders } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import type { SessionManager } from "../session-manager.ts";
+import type { ReadonlySessionManager, SessionManager } from "../session-manager.ts";
 import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
 	BeforeAgentStartEvent,
@@ -39,6 +40,11 @@ import type {
 	InputEventResult,
 	InputSource,
 	LoadExtensionsResult,
+	ManagedExtensionAction,
+	ManagedExtensionActionRequest,
+	ManagedExtensionHost,
+	ManagedHostActivityBinding,
+	ManagedToolActivityScope,
 	MarkdownTransformer,
 	MessageEndEvent,
 	MessageEndEventResult,
@@ -65,6 +71,99 @@ import type {
 	UserBashEvent,
 	UserBashEventResult,
 } from "./types.ts";
+
+interface ActiveManagedActionScope {
+	readonly scopeId: string;
+	readonly extensionPath: string;
+	readonly eventType: string;
+	readonly handlerIndex: number;
+	readonly binding: ManagedHostActivityBinding;
+	readonly pending: Promise<unknown>[];
+	nextActionIndex: number;
+	open: boolean;
+}
+
+class ManagedExtensionBoundaryError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "ManagedExtensionBoundaryError";
+	}
+}
+
+function sameManagedBinding(left: ManagedHostActivityBinding, right: ManagedHostActivityBinding): boolean {
+	return (
+		left.generationId === right.generationId &&
+		left.generationLeaseToken === right.generationLeaseToken &&
+		left.activityToken === right.activityToken &&
+		left.runId === right.runId &&
+		left.coreInvocationId === right.coreInvocationId
+	);
+}
+
+function createReadonlySessionManager(manager: SessionManager): ReadonlySessionManager {
+	return Object.freeze({
+		getCwd: () => manager.getCwd(),
+		getSessionDir: () => manager.getSessionDir(),
+		getSessionId: () => manager.getSessionId(),
+		getSessionFile: () => manager.getSessionFile(),
+		getLeafId: () => manager.getLeafId(),
+		getLeafEntry: () => {
+			const entry = manager.getLeafEntry();
+			return entry ? structuredClone(entry) : undefined;
+		},
+		getEntry: (id: string) => {
+			const entry = manager.getEntry(id);
+			return entry ? structuredClone(entry) : undefined;
+		},
+		getLabel: (id: string) => manager.getLabel(id),
+		getBranch: (leafId?: string) => structuredClone(manager.getBranch(leafId)),
+		buildContextEntries: () => structuredClone(manager.buildContextEntries()),
+		getHeader: () => {
+			const header = manager.getHeader();
+			return header ? structuredClone(header) : null;
+		},
+		getEntries: () => structuredClone(manager.getEntries()),
+		getTree: () => structuredClone(manager.getTree()),
+		getSessionName: () => manager.getSessionName(),
+	});
+}
+
+function createReadonlyModelRegistry(registry: ModelRegistry): ModelRegistry {
+	return new Proxy(registry, {
+		get(_target, property) {
+			switch (property) {
+				case "getError":
+					return () => registry.getError();
+				case "getAll":
+					return () => structuredClone(registry.getAll());
+				case "getAvailable":
+					return () => structuredClone(registry.getAvailable());
+				case "find":
+					return (provider: string, modelId: string) => {
+						const model = registry.find(provider, modelId);
+						return model ? structuredClone(model) : undefined;
+					};
+				case "hasConfiguredAuth":
+					return (model: Model<Api>) => registry.hasConfiguredAuth(model);
+				case "getProviderAuthStatus":
+					return (provider: string) => structuredClone(registry.getProviderAuthStatus(provider));
+				case "getProviderDisplayName":
+					return (provider: string) => registry.getProviderDisplayName(provider);
+				case "isUsingOAuth":
+					return (model: Model<Api>) => registry.isUsingOAuth(model);
+				case "getRegisteredProviderIds":
+					return () => [...registry.getRegisteredProviderIds()];
+				default:
+					throw new ManagedExtensionBoundaryError(
+						`Managed extension modelRegistry.${String(property)} is not a pure catalogue read`,
+					);
+			}
+		},
+		set() {
+			throw new ManagedExtensionBoundaryError("Managed extension modelRegistry is read-only");
+		},
+	});
+}
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
 // Only editor-global shortcuts are reserved here. Picker-specific bindings are not.
@@ -271,8 +370,12 @@ export class ExtensionRunner {
 	private uiContext: ExtensionUIContext;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
-	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
+	private readonly readonlySessionManager: ReadonlySessionManager;
+	private readonly readonlyModelRegistry: ModelRegistry;
+	private readonly managedHost: ManagedExtensionHost | undefined;
+	private readonly managedActionStorage = new AsyncLocalStorage<ActiveManagedActionScope>();
+	private managedScopeSequence = 0;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
@@ -302,13 +405,192 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
+		managedHost?: ManagedExtensionHost,
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
-		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+		this.readonlySessionManager = createReadonlySessionManager(sessionManager);
+		this.readonlyModelRegistry = managedHost ? createReadonlyModelRegistry(modelRegistry) : modelRegistry;
+		this.managedHost = managedHost;
+	}
+
+	private requireManagedBinding(): ManagedHostActivityBinding {
+		const binding = this.managedHost?.getActivityBinding();
+		if (!binding || !binding.generationId || !binding.generationLeaseToken || !binding.activityToken) {
+			throw new ManagedExtensionBoundaryError("Managed extension scope has no active host activity binding");
+		}
+		return binding;
+	}
+
+	private async runManagedScope<T>(
+		extensionPath: string,
+		eventType: string,
+		handlerIndex: number,
+		callback: () => T | Promise<T>,
+		binding?: ManagedHostActivityBinding,
+	): Promise<T> {
+		if (!this.managedHost) {
+			return await callback();
+		}
+		const resolvedBinding = binding ?? this.managedHost.getActivityBinding();
+		if (!resolvedBinding) {
+			try {
+				return await this.managedActionStorage.exit(callback);
+			} catch (error) {
+				if (error instanceof ManagedExtensionBoundaryError) throw error;
+				throw new ManagedExtensionBoundaryError(
+					`Managed extension read-only scope ${eventType} failed: ${error instanceof Error ? error.message : String(error)}`,
+					{ cause: error },
+				);
+			}
+		}
+		if (!resolvedBinding.generationId || !resolvedBinding.generationLeaseToken || !resolvedBinding.activityToken) {
+			throw new ManagedExtensionBoundaryError("Managed extension scope received an invalid host activity binding");
+		}
+		const scope: ActiveManagedActionScope = {
+			scopeId: `${resolvedBinding.activityToken}:${++this.managedScopeSequence}`,
+			extensionPath,
+			eventType,
+			handlerIndex,
+			binding: resolvedBinding,
+			pending: [],
+			nextActionIndex: 0,
+			open: true,
+		};
+
+		try {
+			const result = await this.managedActionStorage.run(scope, callback);
+			let drained = 0;
+			while (drained < scope.pending.length) {
+				const pending = scope.pending.slice(drained);
+				drained = scope.pending.length;
+				await Promise.all(pending);
+			}
+			return result;
+		} catch (error) {
+			if (error instanceof ManagedExtensionBoundaryError) throw error;
+			throw new ManagedExtensionBoundaryError(
+				`Managed extension scope ${scope.scopeId} failed: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			);
+		} finally {
+			scope.open = false;
+		}
+	}
+
+	private async invokeExtensionHandler<T>(
+		extensionPath: string,
+		eventType: string,
+		handlerIndex: number,
+		callback: () => T | Promise<T>,
+	): Promise<T> {
+		return this.runManagedScope(extensionPath, eventType, handlerIndex, callback);
+	}
+
+	private rethrowManagedBoundary(error: unknown): void {
+		if (error instanceof ManagedExtensionBoundaryError) throw error;
+	}
+
+	private dispatchManagedAction<T>(
+		extensionPath: string | undefined,
+		action: ManagedExtensionAction,
+		execute: () => T | Promise<T>,
+	): Promise<T> {
+		if (!this.managedHost) {
+			return Promise.resolve(execute());
+		}
+
+		const active = this.managedActionStorage.getStore();
+		if (!active || !active.open) {
+			throw new ManagedExtensionBoundaryError(
+				`Managed extension action ${action.type} was invoked outside an active ExtensionActionScope`,
+			);
+		}
+		if (extensionPath !== undefined && extensionPath !== active.extensionPath) {
+			throw new ManagedExtensionBoundaryError(
+				`Managed extension identity mismatch: expected ${active.extensionPath}, received ${extensionPath}`,
+			);
+		}
+
+		const currentBinding = this.requireManagedBinding();
+		if (!sameManagedBinding(active.binding, currentBinding)) {
+			throw new ManagedExtensionBoundaryError(`Managed extension scope ${active.scopeId} crossed an activity fence`);
+		}
+
+		const request: ManagedExtensionActionRequest = {
+			scope: {
+				scopeId: active.scopeId,
+				extensionPath: active.extensionPath,
+				eventType: active.eventType,
+				handlerIndex: active.handlerIndex,
+				actionIndex: ++active.nextActionIndex,
+				binding: active.binding,
+			},
+			action,
+		};
+		const executeAdmittedAction = async (): Promise<T> => {
+			if (!active.open) {
+				throw new ManagedExtensionBoundaryError(
+					`Managed extension scope ${active.scopeId} closed before admitted action ${action.type} executed`,
+				);
+			}
+			const executionBinding = this.requireManagedBinding();
+			if (!sameManagedBinding(active.binding, executionBinding)) {
+				throw new ManagedExtensionBoundaryError(
+					`Managed extension scope ${active.scopeId} crossed an activity fence before execution`,
+				);
+			}
+			return await execute();
+		};
+		const promise = this.managedHost.dispatchExtensionAction(request, executeAdmittedAction);
+		active.pending.push(promise);
+		void promise.catch(() => {});
+		return promise;
+	}
+
+	private startExtensionAction(extensionPath: string, event: string, promise: Promise<unknown>): void {
+		if (this.managedHost) return;
+		void promise.catch((error) => {
+			this.emitError({
+				extensionPath,
+				event,
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+		});
+	}
+
+	async executeTool<TDetails>(
+		registeredTool: RegisteredTool,
+		toolCallId: string,
+		execute: () => Promise<AgentToolResult<TDetails>>,
+	): Promise<AgentToolResult<TDetails>> {
+		if (!this.managedHost) return execute();
+
+		const binding = this.requireManagedBinding();
+		if (!binding.runId || !binding.coreInvocationId) {
+			throw new ManagedExtensionBoundaryError(
+				`Managed tool ${registeredTool.definition.name} has no active Run/CoreInvocation binding`,
+			);
+		}
+		const scope: ManagedToolActivityScope = {
+			...binding,
+			runId: binding.runId,
+			coreInvocationId: binding.coreInvocationId,
+			toolCallId,
+			toolName: registeredTool.definition.name,
+			toolSource: registeredTool.sourceInfo,
+		};
+		return this.runManagedScope(
+			registeredTool.sourceInfo.path,
+			`tool:${registeredTool.definition.name}:${toolCallId}`,
+			0,
+			() => this.managedHost!.executeTool(scope, execute),
+			binding,
+		);
 	}
 
 	bindCore(
@@ -320,21 +602,82 @@ export class ExtensionRunner {
 			unregisterProvider?: (name: string) => void;
 		},
 	): void {
-		// Copy actions into the shared runtime (all extension APIs reference this)
-		this.runtime.sendMessage = actions.sendMessage;
-		this.runtime.sendUserMessage = actions.sendUserMessage;
-		this.runtime.appendEntry = actions.appendEntry;
-		this.runtime.setSessionName = actions.setSessionName;
+		// Per-extension API facades preserve their identity at every mutation boundary.
+		this.runtime.sendMessage = (extensionPath, message, options) => {
+			this.startExtensionAction(
+				extensionPath,
+				"send_message",
+				this.dispatchManagedAction(extensionPath, { type: "send_message", message, options }, () =>
+					actions.sendMessage(message, options),
+				),
+			);
+		};
+		this.runtime.sendUserMessage = (extensionPath, content, options) => {
+			this.startExtensionAction(
+				extensionPath,
+				"send_user_message",
+				this.dispatchManagedAction(extensionPath, { type: "send_user_message", content, options }, () =>
+					actions.sendUserMessage(content, options),
+				),
+			);
+		};
+		this.runtime.appendEntry = (extensionPath, customType, data) => {
+			this.startExtensionAction(
+				extensionPath,
+				"append_entry",
+				this.dispatchManagedAction(extensionPath, { type: "append_entry", customType, data }, () =>
+					actions.appendEntry(customType, data),
+				),
+			);
+		};
+		this.runtime.setSessionName = (extensionPath, name) => {
+			this.startExtensionAction(
+				extensionPath,
+				"set_session_name",
+				this.dispatchManagedAction(extensionPath, { type: "set_session_name", name }, () =>
+					actions.setSessionName(name),
+				),
+			);
+		};
 		this.runtime.getSessionName = actions.getSessionName;
-		this.runtime.setLabel = actions.setLabel;
+		this.runtime.setLabel = (extensionPath, entryId, label) => {
+			this.startExtensionAction(
+				extensionPath,
+				"set_label",
+				this.dispatchManagedAction(extensionPath, { type: "set_label", entryId, label }, () =>
+					actions.setLabel(entryId, label),
+				),
+			);
+		};
+		this.runtime.exec = (extensionPath, command, args, options) =>
+			this.dispatchManagedAction(extensionPath, { type: "exec", command, args, options }, () =>
+				actions.exec(command, args, options),
+			);
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
-		this.runtime.setActiveTools = actions.setActiveTools;
+		this.runtime.setActiveTools = (extensionPath, toolNames) => {
+			this.startExtensionAction(
+				extensionPath,
+				"set_active_tools",
+				this.dispatchManagedAction(extensionPath, { type: "set_active_tools", toolNames }, () =>
+					actions.setActiveTools(toolNames),
+				),
+			);
+		};
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
-		this.runtime.setModel = actions.setModel;
+		this.runtime.setModel = (extensionPath, model) =>
+			this.dispatchManagedAction(extensionPath, { type: "set_model", model }, () => actions.setModel(model));
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
-		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.setThinkingLevel = (extensionPath, level) => {
+			this.startExtensionAction(
+				extensionPath,
+				"set_thinking_level",
+				this.dispatchManagedAction(extensionPath, { type: "set_thinking_level", level }, () =>
+					actions.setThinkingLevel(level),
+				),
+			);
+		};
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
@@ -351,6 +694,15 @@ export class ExtensionRunner {
 		this.getSystemPromptOptionsFn = contextActions.getSystemPromptOptions ?? (() => ({ cwd: this.cwd }));
 
 		// Flush provider registrations queued during extension loading
+		if (
+			this.managedHost &&
+			(this.runtime.pendingProviderRegistrations.length > 0 ||
+				this.runtime.pendingNativeProviderRegistrations.length > 0)
+		) {
+			throw new ManagedExtensionBoundaryError(
+				"Managed extensions cannot register providers during module initialization",
+			);
+		}
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
 			try {
 				if (providerActions?.registerProvider) {
@@ -388,26 +740,44 @@ export class ExtensionRunner {
 
 		// From this point on, provider registration/unregistration takes effect immediately
 		// without requiring a /reload.
-		this.runtime.registerProvider = (name, config) => {
-			if (providerActions?.registerProvider) {
-				providerActions.registerProvider(name, config);
-				return;
-			}
-			this.modelRegistry.registerProvider(name, config);
+		this.runtime.registerProvider = (name, config, extensionPath) => {
+			this.startExtensionAction(
+				extensionPath,
+				"register_provider",
+				this.dispatchManagedAction(extensionPath, { type: "register_provider", name, config }, () => {
+					if (providerActions?.registerProvider) {
+						providerActions.registerProvider(name, config);
+						return;
+					}
+					this.modelRegistry.registerProvider(name, config);
+				}),
+			);
 		};
-		this.runtime.registerNativeProvider = (provider) => {
-			if (providerActions?.registerNativeProvider) {
-				providerActions.registerNativeProvider(provider);
-				return;
-			}
-			this.modelRegistry.registerProvider(provider);
+		this.runtime.registerNativeProvider = (provider, extensionPath) => {
+			this.startExtensionAction(
+				extensionPath,
+				"register_native_provider",
+				this.dispatchManagedAction(extensionPath, { type: "register_native_provider", provider }, () => {
+					if (providerActions?.registerNativeProvider) {
+						providerActions.registerNativeProvider(provider);
+						return;
+					}
+					this.modelRegistry.registerProvider(provider);
+				}),
+			);
 		};
-		this.runtime.unregisterProvider = (name) => {
-			if (providerActions?.unregisterProvider) {
-				providerActions.unregisterProvider(name);
-				return;
-			}
-			this.modelRegistry.unregisterProvider(name);
+		this.runtime.unregisterProvider = (name, extensionPath) => {
+			this.startExtensionAction(
+				extensionPath,
+				"unregister_provider",
+				this.dispatchManagedAction(extensionPath, { type: "unregister_provider", name }, () => {
+					if (providerActions?.unregisterProvider) {
+						providerActions.unregisterProvider(name);
+						return;
+					}
+					this.modelRegistry.unregisterProvider(name);
+				}),
+			);
 		};
 	}
 
@@ -530,7 +900,13 @@ export class ExtensionRunner {
 						shortcut.extensionPath,
 					);
 				}
-				extensionShortcuts.set(normalizedKey, shortcut);
+				extensionShortcuts.set(normalizedKey, {
+					...shortcut,
+					handler: (ctx) =>
+						this.runManagedScope(shortcut.extensionPath, `shortcut:${normalizedKey}`, 0, () =>
+							shortcut.handler(ctx),
+						),
+				});
 			}
 		}
 		return extensionShortcuts;
@@ -632,6 +1008,10 @@ export class ExtensionRunner {
 			return {
 				...command,
 				invocationName,
+				handler: (args, ctx) =>
+					this.runManagedScope(command.sourceInfo.path, `command:${invocationName}`, 0, () =>
+						command.handler(args, ctx),
+					),
 			};
 		});
 	}
@@ -693,11 +1073,11 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return runner.readonlySessionManager;
 			},
 			get modelRegistry() {
 				runner.assertActive();
-				return runner.modelRegistry;
+				return runner.readonlyModelRegistry;
 			},
 			get model() {
 				runner.assertActive();
@@ -725,7 +1105,7 @@ export class ExtensionRunner {
 			},
 			abort: () => {
 				runner.assertActive();
-				runner.abortFn();
+				void runner.dispatchManagedAction(undefined, { type: "abort" }, () => runner.abortFn());
 			},
 			hasPendingMessages: () => {
 				runner.assertActive();
@@ -733,7 +1113,7 @@ export class ExtensionRunner {
 			},
 			shutdown: () => {
 				runner.assertActive();
-				runner.shutdownHandler();
+				void runner.dispatchManagedAction(undefined, { type: "shutdown" }, () => runner.shutdownHandler());
 			},
 			getContextUsage: () => {
 				runner.assertActive();
@@ -741,7 +1121,7 @@ export class ExtensionRunner {
 			},
 			compact: (options) => {
 				runner.assertActive();
-				runner.compactFn(options);
+				void runner.dispatchManagedAction(undefined, { type: "compact", options }, () => runner.compactFn(options));
 			},
 			getSystemPrompt: () => {
 				runner.assertActive();
@@ -768,23 +1148,31 @@ export class ExtensionRunner {
 		};
 		context.newSession = (options) => {
 			this.assertActive();
-			return this.newSessionHandler(options);
+			return this.dispatchManagedAction(undefined, { type: "new_session", options }, () =>
+				this.newSessionHandler(options),
+			);
 		};
 		context.fork = (entryId, options) => {
 			this.assertActive();
-			return this.forkHandler(entryId, options);
+			return this.dispatchManagedAction(undefined, { type: "fork", entryId, options }, () =>
+				this.forkHandler(entryId, options),
+			);
 		};
 		context.navigateTree = (targetId, options) => {
 			this.assertActive();
-			return this.navigateTreeHandler(targetId, options);
+			return this.dispatchManagedAction(undefined, { type: "navigate_tree", targetId, options }, () =>
+				this.navigateTreeHandler(targetId, options),
+			);
 		};
 		context.switchSession = (sessionPath, options) => {
 			this.assertActive();
-			return this.switchSessionHandler(sessionPath, options);
+			return this.dispatchManagedAction(undefined, { type: "switch_session", sessionPath, options }, () =>
+				this.switchSessionHandler(sessionPath, options),
+			);
 		};
 		context.reload = () => {
 			this.assertActive();
-			return this.reloadHandler();
+			return this.dispatchManagedAction(undefined, { type: "reload" }, () => this.reloadHandler());
 		};
 		return context;
 	}
@@ -806,9 +1194,11 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.invokeExtensionHandler(ext.path, event.type, handlerIndex, () =>
+						handler(event, ctx),
+					);
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
 						result = handlerResult as SessionBeforeEventResult;
@@ -817,6 +1207,7 @@ export class ExtensionRunner {
 						}
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -841,10 +1232,12 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("message_end");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
 					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
-					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
+					const handlerResult = (await this.invokeExtensionHandler(ext.path, "message_end", handlerIndex, () =>
+						handler(currentEvent, ctx),
+					)) as MessageEndEventResult | undefined;
 					if (!handlerResult?.message) continue;
 
 					if (handlerResult.message.role !== currentMessage.role) {
@@ -859,6 +1252,7 @@ export class ExtensionRunner {
 					currentMessage = handlerResult.message;
 					modified = true;
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -883,9 +1277,11 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("tool_result");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
-					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					const handlerResult = (await this.invokeExtensionHandler(ext.path, "tool_result", handlerIndex, () =>
+						handler(currentEvent, ctx),
+					)) as ToolResultEventResult | undefined;
 					if (!handlerResult) continue;
 
 					if (handlerResult.content !== undefined) {
@@ -905,6 +1301,7 @@ export class ExtensionRunner {
 						modified = true;
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -937,8 +1334,10 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("tool_call");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
-				const handlerResult = await handler(event, ctx);
+			for (const [handlerIndex, handler] of handlers.entries()) {
+				const handlerResult = await this.invokeExtensionHandler(ext.path, "tool_call", handlerIndex, () =>
+					handler(event, ctx),
+				);
 
 				if (handlerResult) {
 					result = handlerResult as ToolCallEventResult;
@@ -959,13 +1358,16 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("user_bash");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.invokeExtensionHandler(ext.path, "user_bash", handlerIndex, () =>
+						handler(event, ctx),
+					);
 					if (handlerResult) {
 						return handlerResult as UserBashEventResult;
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -989,15 +1391,18 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("context");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
 					const event: ContextEvent = { type: "context", messages: currentMessages };
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.invokeExtensionHandler(ext.path, "context", handlerIndex, () =>
+						handler(event, ctx),
+					);
 
 					if (handlerResult && (handlerResult as ContextEventResult).messages) {
 						currentMessages = (handlerResult as ContextEventResult).messages!;
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1021,17 +1426,23 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("before_provider_request");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
 					const event: BeforeProviderRequestEvent = {
 						type: "before_provider_request",
 						payload: currentPayload,
 					};
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.invokeExtensionHandler(
+						ext.path,
+						"before_provider_request",
+						handlerIndex,
+						() => handler(event, ctx),
+					);
 					if (handlerResult !== undefined) {
 						currentPayload = handlerResult;
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1054,15 +1465,18 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("before_provider_headers");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
 					// Handlers mutate `headers` in place; the return value is ignored.
 					const event: BeforeProviderHeadersEvent = {
 						type: "before_provider_headers",
 						headers,
 					};
-					await handler(event, ctx);
+					await this.invokeExtensionHandler(ext.path, "before_provider_headers", handlerIndex, () =>
+						handler(event, ctx),
+					);
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1100,7 +1514,7 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("before_agent_start");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
 					const event: BeforeAgentStartEvent = {
 						type: "before_agent_start",
@@ -1109,7 +1523,12 @@ export class ExtensionRunner {
 						systemPrompt: currentSystemPrompt,
 						systemPromptOptions,
 					};
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.invokeExtensionHandler(
+						ext.path,
+						"before_agent_start",
+						handlerIndex,
+						() => handler(event, ctx),
+					);
 
 					if (handlerResult) {
 						const result = handlerResult as BeforeAgentStartEventResult;
@@ -1122,6 +1541,7 @@ export class ExtensionRunner {
 						}
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1161,10 +1581,15 @@ export class ExtensionRunner {
 			const handlers = ext.handlers.get("resources_discover");
 			if (!handlers || handlers.length === 0) continue;
 
-			for (const handler of handlers) {
+			for (const [handlerIndex, handler] of handlers.entries()) {
 				try {
 					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.invokeExtensionHandler(
+						ext.path,
+						"resources_discover",
+						handlerIndex,
+						() => handler(event, ctx),
+					);
 					const result = handlerResult as ResourcesDiscoverResult | undefined;
 
 					if (result?.skillPaths?.length) {
@@ -1177,6 +1602,7 @@ export class ExtensionRunner {
 						themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path })));
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1204,7 +1630,7 @@ export class ExtensionRunner {
 		let currentImages = images;
 
 		for (const ext of this.extensions) {
-			for (const handler of ext.handlers.get("input") ?? []) {
+			for (const [handlerIndex, handler] of (ext.handlers.get("input") ?? []).entries()) {
 				try {
 					const event: InputEvent = {
 						type: "input",
@@ -1213,13 +1639,16 @@ export class ExtensionRunner {
 						source,
 						streamingBehavior,
 					};
-					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					const result = (await this.invokeExtensionHandler(ext.path, "input", handlerIndex, () =>
+						handler(event, ctx),
+					)) as InputEventResult | undefined;
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
 						currentImages = result.images ?? currentImages;
 					}
 				} catch (err) {
+					this.rethrowManagedBoundary(err);
 					this.emitError({
 						extensionPath: ext.path,
 						event: "input",

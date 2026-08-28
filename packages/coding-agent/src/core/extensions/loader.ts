@@ -28,7 +28,6 @@ import * as _bundledPiCodingAgent from "../../index.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
-import { execCommand } from "../exec.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
@@ -36,6 +35,7 @@ import type {
 	EntryRenderer,
 	Extension,
 	ExtensionAPI,
+	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime,
 	LoadExtensionsResult,
@@ -190,6 +190,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
+		exec: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getActiveTools: notInitialized,
 		getAllTools: notInitialized,
 		setActiveTools: notInitialized,
@@ -224,10 +225,10 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		},
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
-		registerProvider: (name, config, extensionPath = "<unknown>") => {
+		registerProvider: (name, config, extensionPath) => {
 			runtime.pendingProviderRegistrations.push({ name, config, extensionPath });
 		},
-		registerNativeProvider: (provider, extensionPath = "<unknown>") => {
+		registerNativeProvider: (provider, extensionPath) => {
 			runtime.pendingNativeProviderRegistrations.push({ provider, extensionPath });
 		},
 		unregisterProvider: (name) => {
@@ -283,7 +284,7 @@ function createExtensionAPI(
 			shortcut: KeyId,
 			options: {
 				description?: string;
-				handler: (ctx: import("./types.ts").ExtensionContext) => Promise<void> | void;
+				handler: (ctx: ExtensionContext) => Promise<void> | void;
 			},
 		): void {
 			runtime.assertActive();
@@ -327,22 +328,22 @@ function createExtensionAPI(
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
 			runtime.assertActive();
-			runtime.sendMessage(message, options);
+			runtime.sendMessage(extension.path, message, options);
 		},
 
 		sendUserMessage(content, options): void {
 			runtime.assertActive();
-			runtime.sendUserMessage(content, options);
+			runtime.sendUserMessage(extension.path, content, options);
 		},
 
 		appendEntry(customType: string, data?: unknown): void {
 			runtime.assertActive();
-			runtime.appendEntry(customType, data);
+			runtime.appendEntry(extension.path, customType, data);
 		},
 
 		setSessionName(name: string): void {
 			runtime.assertActive();
-			runtime.setSessionName(name);
+			runtime.setSessionName(extension.path, name);
 		},
 
 		getSessionName(): string | undefined {
@@ -352,12 +353,12 @@ function createExtensionAPI(
 
 		setLabel(entryId: string, label: string | undefined): void {
 			runtime.assertActive();
-			runtime.setLabel(entryId, label);
+			runtime.setLabel(extension.path, entryId, label);
 		},
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			runtime.assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			return runtime.exec(extension.path, command, args, { ...options, cwd: options?.cwd ?? cwd });
 		},
 
 		getActiveTools(): string[] {
@@ -372,7 +373,7 @@ function createExtensionAPI(
 
 		setActiveTools(toolNames: string[]): void {
 			runtime.assertActive();
-			runtime.setActiveTools(toolNames);
+			runtime.setActiveTools(extension.path, toolNames);
 		},
 
 		getCommands() {
@@ -382,7 +383,7 @@ function createExtensionAPI(
 
 		setModel(model) {
 			runtime.assertActive();
-			return runtime.setModel(model);
+			return runtime.setModel(extension.path, model);
 		},
 
 		getThinkingLevel() {
@@ -392,7 +393,7 @@ function createExtensionAPI(
 
 		setThinkingLevel(level) {
 			runtime.assertActive();
-			runtime.setThinkingLevel(level);
+			runtime.setThinkingLevel(extension.path, level);
 		},
 
 		registerProvider(providerOrName: Provider | string, config?: ProviderConfig) {

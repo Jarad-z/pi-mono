@@ -104,6 +104,14 @@ export type {
 	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
+	ManagedExtensionAction,
+	ManagedExtensionActionGateway,
+	ManagedExtensionActionRequest,
+	ManagedExtensionActionScope,
+	ManagedExtensionHost,
+	ManagedHostActivityBinding,
+	ManagedToolActivityScope,
+	ManagedToolExecutionGateway,
 	MarkdownTransformContext,
 	MarkdownTransformer,
 	MessageEndEvent,
@@ -172,7 +180,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export { convertToLlm } from "./core/messages.ts";
-export { ModelRegistry } from "./core/model-registry.ts";
+export { ModelRegistry, type ReadonlyModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,
 	type ResolveCliModelResult,

@@ -315,7 +315,7 @@ export interface ExtensionContext {
 	cwd: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
-	/** Model registry for API key resolution */
+	/** Model registry. Managed mode exposes an object-level read-only facade. */
 	modelRegistry: ModelRegistry;
 	/** Current model (may be undefined) */
 	model: Model<any> | undefined;
@@ -1537,6 +1537,91 @@ export interface RegisteredTool {
 	sourceInfo: SourceInfo;
 }
 
+/** Host-owned durable activity identity resolved at the exact time an extension action or tool executes. */
+export interface ManagedHostActivityBinding {
+	generationId: string;
+	generationLeaseToken: string;
+	activityToken: string;
+	runId?: string;
+	coreInvocationId?: string;
+}
+
+/** Causality attached to every mutation admitted from a managed extension handler. */
+export interface ManagedExtensionActionScope {
+	scopeId: string;
+	extensionPath: string;
+	eventType: string;
+	handlerIndex: number;
+	actionIndex: number;
+	binding: ManagedHostActivityBinding;
+}
+
+/** Closed set of extension mutations that must pass through the managed host gateway. */
+export type ManagedExtensionAction =
+	| {
+			type: "send_message";
+			message: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
+			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" };
+	  }
+	| {
+			type: "send_user_message";
+			content: string | (TextContent | ImageContent)[];
+			options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean };
+	  }
+	| { type: "append_entry"; customType: string; data?: unknown }
+	| { type: "set_session_name"; name: string }
+	| { type: "set_label"; entryId: string; label: string | undefined }
+	| { type: "exec"; command: string; args: string[]; options?: ExecOptions }
+	| { type: "set_active_tools"; toolNames: string[] }
+	| { type: "set_model"; model: Model<any> }
+	| { type: "set_thinking_level"; level: ThinkingLevel }
+	| { type: "register_provider"; name: string; config: ProviderConfig }
+	| { type: "register_native_provider"; provider: Provider }
+	| { type: "unregister_provider"; name: string }
+	| { type: "abort" }
+	| { type: "shutdown" }
+	| { type: "compact"; options?: CompactOptions }
+	| { type: "new_session"; options?: Parameters<ExtensionCommandContext["newSession"]>[0] }
+	| { type: "fork"; entryId: string; options?: Parameters<ExtensionCommandContext["fork"]>[1] }
+	| { type: "navigate_tree"; targetId: string; options?: Parameters<ExtensionCommandContext["navigateTree"]>[1] }
+	| { type: "switch_session"; sessionPath: string; options?: Parameters<ExtensionCommandContext["switchSession"]>[1] }
+	| { type: "reload" };
+
+export interface ManagedExtensionActionRequest {
+	scope: ManagedExtensionActionScope;
+	action: ManagedExtensionAction;
+}
+
+/**
+ * Awaited interceptor for managed extension mutations. The host durably admits the request and
+ * invokes execute only when the captured generation/activity fence is still current.
+ */
+export type ManagedExtensionActionGateway = <T>(
+	request: ManagedExtensionActionRequest,
+	execute: () => Promise<T>,
+) => Promise<T>;
+
+/** Invocation-time tool causality. Unlike tool definitions, this object must never be cached. */
+export interface ManagedToolActivityScope extends ManagedHostActivityBinding {
+	runId: string;
+	coreInvocationId: string;
+	toolCallId: string;
+	toolName: string;
+	toolSource: SourceInfo;
+}
+
+export type ManagedToolExecutionGateway = <TDetails>(
+	scope: ManagedToolActivityScope,
+	execute: () => Promise<AgentToolResult<TDetails>>,
+) => Promise<AgentToolResult<TDetails>>;
+
+/** Complete managed extension/tool boundary installed by the durable host. */
+export interface ManagedExtensionHost {
+	getActivityBinding(): ManagedHostActivityBinding | undefined;
+	dispatchExtensionAction: ManagedExtensionActionGateway;
+	executeTool: ManagedToolExecutionGateway;
+}
+
 export interface ExtensionFlag {
 	name: string;
 	description?: string;
@@ -1615,9 +1700,9 @@ export interface ExtensionRuntimeState {
 	 * Before bindCore(): queues registrations / removes from queue.
 	 * After bindCore(): calls ModelRegistry directly for immediate effect.
 	 */
-	registerProvider: (name: string, config: ProviderConfig, extensionPath?: string) => void;
-	registerNativeProvider: (provider: Provider, extensionPath?: string) => void;
-	unregisterProvider: (name: string, extensionPath?: string) => void;
+	registerProvider: (name: string, config: ProviderConfig, extensionPath: string) => void;
+	registerNativeProvider: (provider: Provider, extensionPath: string) => void;
+	unregisterProvider: (name: string, extensionPath: string) => void;
 }
 
 /**
@@ -1625,20 +1710,21 @@ export interface ExtensionRuntimeState {
  * Provided to runner.initialize(), copied into the shared runtime.
  */
 export interface ExtensionActions {
-	sendMessage: SendMessageHandler;
-	sendUserMessage: SendUserMessageHandler;
-	appendEntry: AppendEntryHandler;
-	setSessionName: SetSessionNameHandler;
+	sendMessage: (...args: Parameters<SendMessageHandler>) => void | Promise<void>;
+	sendUserMessage: (...args: Parameters<SendUserMessageHandler>) => void | Promise<void>;
+	appendEntry: (...args: Parameters<AppendEntryHandler>) => void | Promise<void>;
+	setSessionName: (...args: Parameters<SetSessionNameHandler>) => void | Promise<void>;
 	getSessionName: GetSessionNameHandler;
-	setLabel: SetLabelHandler;
+	setLabel: (...args: Parameters<SetLabelHandler>) => void | Promise<void>;
+	exec: (command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
-	setActiveTools: SetActiveToolsHandler;
+	setActiveTools: (...args: Parameters<SetActiveToolsHandler>) => void | Promise<void>;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
-	setThinkingLevel: SetThinkingLevelHandler;
+	setThinkingLevel: (...args: Parameters<SetThinkingLevelHandler>) => void | Promise<void>;
 }
 
 /**
@@ -1687,10 +1773,26 @@ export interface ExtensionCommandContextActions {
 }
 
 /**
- * Full runtime = state + actions.
- * Created by loader with throwing action stubs, completed by runner.initialize().
+ * Shared runtime used by per-extension API facades. Mutation methods carry the originating
+ * extension identity; read methods remain direct projections of ExtensionActions.
  */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+export interface ExtensionRuntime extends ExtensionRuntimeState {
+	sendMessage: (extensionPath: string, ...args: Parameters<SendMessageHandler>) => void;
+	sendUserMessage: (extensionPath: string, ...args: Parameters<SendUserMessageHandler>) => void;
+	appendEntry: (extensionPath: string, ...args: Parameters<AppendEntryHandler>) => void;
+	setSessionName: (extensionPath: string, ...args: Parameters<SetSessionNameHandler>) => void;
+	getSessionName: GetSessionNameHandler;
+	setLabel: (extensionPath: string, ...args: Parameters<SetLabelHandler>) => void;
+	exec: (extensionPath: string, command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>;
+	getActiveTools: GetActiveToolsHandler;
+	getAllTools: GetAllToolsHandler;
+	setActiveTools: (extensionPath: string, ...args: Parameters<SetActiveToolsHandler>) => void;
+	refreshTools: RefreshToolsHandler;
+	getCommands: GetCommandsHandler;
+	setModel: (extensionPath: string, ...args: Parameters<SetModelHandler>) => Promise<boolean>;
+	getThinkingLevel: GetThinkingLevelHandler;
+	setThinkingLevel: (extensionPath: string, ...args: Parameters<SetThinkingLevelHandler>) => void;
+}
 
 /** Loaded extension with all registered items. */
 export interface Extension {

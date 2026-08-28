@@ -78,6 +78,7 @@ describe("ExtensionRunner", () => {
 		setSessionName: () => {},
 		getSessionName: () => undefined,
 		setLabel: () => {},
+		exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
 		getActiveTools: () => [],
 		getAllTools: () => [],
 		setActiveTools: () => {},
@@ -876,24 +877,28 @@ describe("ExtensionRunner", () => {
 		it("pre-bind unregister removes all queued registrations for a provider", () => {
 			const runtime = createExtensionRuntime();
 
-			runtime.registerProvider("queued-provider", providerModelConfig);
-			runtime.registerProvider("queued-provider", {
-				...providerModelConfig,
-				models: [
-					{
-						id: "instant-model-2",
-						name: "Instant Model 2",
-						reasoning: false,
-						input: ["text"],
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-						contextWindow: 128000,
-						maxTokens: 4096,
-					},
-				],
-			});
+			runtime.registerProvider("queued-provider", providerModelConfig, "/tmp/queued-extension.ts");
+			runtime.registerProvider(
+				"queued-provider",
+				{
+					...providerModelConfig,
+					models: [
+						{
+							id: "instant-model-2",
+							name: "Instant Model 2",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 128000,
+							maxTokens: 4096,
+						},
+					],
+				},
+				"/tmp/queued-extension.ts",
+			);
 			expect(runtime.pendingProviderRegistrations).toHaveLength(2);
 
-			runtime.unregisterProvider("queued-provider");
+			runtime.unregisterProvider("queued-provider", "/tmp/queued-extension.ts");
 			expect(runtime.pendingProviderRegistrations).toHaveLength(0);
 		});
 
@@ -904,7 +909,7 @@ describe("ExtensionRunner", () => {
 			runner.bindCore(extensionActions, extensionContextActions);
 			expect(runtime.pendingProviderRegistrations).toHaveLength(0);
 
-			runtime.registerProvider("instant-provider", providerModelConfig);
+			runtime.registerProvider("instant-provider", providerModelConfig, "/tmp/instant-extension.ts");
 			expect(runtime.pendingProviderRegistrations).toHaveLength(0);
 			expect(modelRegistry.find("instant-provider", "instant-model")?.cost.tiers).toEqual([
 				{
@@ -916,7 +921,7 @@ describe("ExtensionRunner", () => {
 				},
 			]);
 
-			runtime.unregisterProvider("instant-provider");
+			runtime.unregisterProvider("instant-provider", "/tmp/instant-extension.ts");
 			expect(modelRegistry.find("instant-provider", "instant-model")).toBeUndefined();
 		});
 	});

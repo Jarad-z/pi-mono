@@ -74,6 +74,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import { execCommand } from "./exec.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -84,6 +85,7 @@ import {
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
+	type ManagedExtensionHost,
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
@@ -238,6 +240,8 @@ export interface AgentSessionConfig {
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
 	/** Awaited managed queue barrier installed together with the managed host bridge. */
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
+	/** Managed extension mutation gateway plus invocation-time tool activity scope provider. */
+	managedExtensionHost?: ManagedExtensionHost;
 }
 
 export interface ExtensionBindings {
@@ -351,6 +355,7 @@ export class AgentSession {
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 	private readonly _managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
+	private readonly _managedExtensionHost?: ManagedExtensionHost;
 	private _managedPromptPreparationToken: string | undefined;
 	private _preparedManagedPrompt: { activityToken: string; messages: AgentMessage[] } | undefined;
 	private _activeManagedActivityToken: string | undefined;
@@ -431,8 +436,24 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._managedLifecycleSink = config.managedLifecycleSink;
+		this._managedExtensionHost = config.managedExtensionHost
+			? {
+					...config.managedExtensionHost,
+					getActivityBinding: () => {
+						const binding = config.managedExtensionHost?.getActivityBinding();
+						const expectedActivityToken = this._activeManagedActivityToken ?? this._managedPromptPreparationToken;
+						return binding?.activityToken === expectedActivityToken ? binding : undefined;
+					},
+				}
+			: undefined;
 		if (config.managedQueueMaterializationHook && !config.managedLifecycleSink) {
 			throw new Error("Managed queue materialization requires a managed lifecycle sink");
+		}
+		if (config.managedLifecycleSink && !config.managedExtensionHost) {
+			throw new Error("Managed lifecycle requires a managed extension host");
+		}
+		if (config.managedExtensionHost && !config.managedLifecycleSink) {
+			throw new Error("Managed extension host requires a managed lifecycle sink");
 		}
 		if (config.managedQueueMaterializationHook && this.agent.hasQueuedMessages()) {
 			throw new Error("Managed queue materialization cannot adopt legacy queued messages");
@@ -449,9 +470,9 @@ export class AgentSession {
 		}
 		if (
 			this.sessionManager.isManaged() &&
-			(!config.managedLifecycleSink || !this.agent.managedQueueMaterializationHook)
+			(!config.managedLifecycleSink || !this.agent.managedQueueMaterializationHook || !config.managedExtensionHost)
 		) {
-			throw new Error("Managed SessionStore requires lifecycle and queue materialization hooks");
+			throw new Error("Managed SessionStore requires lifecycle, queue materialization, and extension host hooks");
 		}
 
 		// Always subscribe to agent events for internal handling
@@ -2728,40 +2749,35 @@ export class AgentSession {
 
 		runner.bindCore(
 			{
-				sendMessage: (message, options) => {
-					this.sendCustomMessage(message, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_message",
-							error: err instanceof Error ? err.message : String(err),
-						});
-					});
-				},
-				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_user_message",
-							error: err instanceof Error ? err.message : String(err),
-						});
-					});
-				},
-				appendEntry: (customType, data) => {
-					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+				sendMessage: (message, options) => this.sendCustomMessage(message, options),
+				sendUserMessage: (content, options) => this.sendUserMessage(content, options),
+				appendEntry: async (customType, data) => {
+					const entryId = this.sessionManager.isManaged()
+						? await this.sessionManager.appendManagedCustomEntry(customType, data)
+						: this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
 						this._emit({ type: "entry_appended", entry });
 					}
 				},
-				setSessionName: (name) => {
-					this.setSessionName(name);
+				setSessionName: async (name) => {
+					if (this.sessionManager.isManaged()) {
+						await this.setManagedSessionName(name);
+					} else {
+						this.setSessionName(name);
+					}
 				},
 				getSessionName: () => {
 					return this.sessionManager.getSessionName();
 				},
-				setLabel: (entryId, label) => {
-					this.sessionManager.appendLabelChange(entryId, label);
+				setLabel: async (entryId, label) => {
+					if (this.sessionManager.isManaged()) {
+						await this.sessionManager.appendManagedLabelChange(entryId, label);
+					} else {
+						this.sessionManager.appendLabelChange(entryId, label);
+					}
 				},
+				exec: (command, args, options) => execCommand(command, args, options?.cwd ?? this._cwd, options),
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
@@ -2773,7 +2789,13 @@ export class AgentSession {
 					return true;
 				},
 				getThinkingLevel: () => this.thinkingLevel,
-				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				setThinkingLevel: async (level) => {
+					if (this.sessionManager.isManaged()) {
+						await this.setManagedThinkingLevel(level);
+					} else {
+						this.setThinkingLevel(level);
+					}
+				},
 			},
 			{
 				getModel: () => this.model,
@@ -2954,6 +2976,7 @@ export class AgentSession {
 			this._cwd,
 			this.sessionManager,
 			new ModelRegistry(this._modelRuntime),
+			this._managedExtensionHost,
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;

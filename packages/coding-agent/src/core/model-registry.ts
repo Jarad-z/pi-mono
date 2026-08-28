@@ -25,6 +25,21 @@ export type ResolvedRequestAuth =
 	| { ok: false; error: string };
 export { clearApiKeyCache } from "./provider-composer.ts";
 
+/** Pure catalogue reads exposed to extensions. Auth resolution, provider dispatch, refresh, and
+ * registration stay behind AgentSession/managed-host actions. */
+export type ReadonlyModelRegistry = Pick<
+	ModelRegistry,
+	| "getError"
+	| "getAll"
+	| "getAvailable"
+	| "find"
+	| "hasConfiguredAuth"
+	| "getProviderAuthStatus"
+	| "getProviderDisplayName"
+	| "isUsingOAuth"
+	| "getRegisteredProviderIds"
+>;
+
 /**
  * Synchronous compatibility facade exposed to extensions.
  * Coding-agent internals use ModelRuntime directly.
