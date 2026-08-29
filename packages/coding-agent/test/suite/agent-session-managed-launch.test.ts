@@ -25,12 +25,12 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
-function managedExtensionHost(activityToken: string): ManagedExtensionHost {
+function managedExtensionHost(activityToken: string | (() => string)): ManagedExtensionHost {
 	return {
 		getActivityBinding: () => ({
 			generationId: "generation_1",
 			generationLeaseToken: "lease_1",
-			activityToken,
+			activityToken: typeof activityToken === "function" ? activityToken() : activityToken,
 			runId: "run_1",
 			coreInvocationId: "core_1",
 		}),
@@ -336,11 +336,13 @@ describe("AgentSession managed paused launch", () => {
 		expect(harness.session.publishManagedQueueItem(stagedTicket.ticket)).toBe("published");
 		await launch;
 		expect(launchFinished).toBe(true);
-		expect(harness.session.stageManagedQueueItem({
-			itemId: "input_after_close",
-			lane: "steer",
-			message: { role: "user", content: [{ type: "text", text: "later" }], timestamp: Date.now() },
-		})).toEqual({ type: "gate_closed", gateRevision: 1 });
+		expect(
+			harness.session.stageManagedQueueItem({
+				itemId: "input_after_close",
+				lane: "steer",
+				message: { role: "user", content: [{ type: "text", text: "later" }], timestamp: Date.now() },
+			}),
+		).toEqual({ type: "gate_closed", gateRevision: 1 });
 	});
 
 	it("persists reserved managed entries before public message_end visibility", async () => {
@@ -395,15 +397,17 @@ describe("AgentSession managed paused launch", () => {
 		await harness.session.prepareManagedPrompt("activity_start_batch", "initial", {
 			reservedEntryId: "reserved_initial_batch_entry",
 		});
-		await harness.session.launchManagedPrompt("activity_start_batch", [{
-			inputId: "input_next_turn",
-			reservedEntryId: "reserved_next_turn_entry",
-			message: {
-				role: "user",
-				content: [{ type: "text", text: "next turn" }],
-				timestamp: Date.now(),
+		await harness.session.launchManagedPrompt("activity_start_batch", [
+			{
+				inputId: "input_next_turn",
+				reservedEntryId: "reserved_next_turn_entry",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "next turn" }],
+					timestamp: Date.now(),
+				},
 			},
-		}]);
+		]);
 
 		expect(harness.session.messages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
 		expect(store.entries.map((entry) => entry.id)).toEqual([
@@ -416,8 +420,81 @@ describe("AgentSession managed paused launch", () => {
 			"reserved_initial_batch_entry",
 			"reserved_next_turn_entry",
 		]);
-		expect(lifecycle.filter((event) =>
-			event.type === "agent_event" && event.event.type === "message_end")).toHaveLength(3);
+		expect(
+			lifecycle.filter((event) => event.type === "agent_event" && event.event.type === "message_end"),
+		).toHaveLength(3);
+	});
+
+	it("continues an existing transcript through a frozen managed recovery batch", async () => {
+		const store = new ManagedLaunchSessionStore();
+		store.reserved.add("reserved_initial_continue_entry");
+		store.reserved.add("reserved_recovery_entry");
+		const sessionManager = await SessionManager.managed(store);
+		const lifecycle: ManagedAgentSessionLifecycleEvent[] = [];
+		const materialized: string[] = [];
+		let activityToken = "activity_continue_seed";
+		const harness = await createHarness({
+			sessionManager,
+			managedLifecycleSink: async (event) => {
+				lifecycle.push(event);
+			},
+			managedExtensionHost: managedExtensionHost(() => activityToken),
+			managedFailStopSink: ignoreManagedFailStop,
+			managedQueueMaterializationHook: async (items) =>
+				items.map((item) => {
+					materialized.push(item.itemId);
+					return { type: "materialized", itemId: item.itemId, message: item.message };
+				}),
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("seed done"), fauxAssistantMessage("recovered")]);
+
+		await harness.session.prepareManagedPrompt(activityToken, "original prompt", {
+			reservedEntryId: "reserved_initial_continue_entry",
+		});
+		await harness.session.launchManagedPrompt(activityToken);
+
+		activityToken = "activity_continue_recovery";
+		await expect(harness.session.prepareManagedContinue(activityToken)).resolves.toEqual({
+			outcome: "ready",
+			activityToken,
+		});
+		expect(harness.session.hasPreparedManagedContinue).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(1);
+
+		await harness.session.launchManagedContinue(activityToken, [
+			{
+				inputId: "input_recovery",
+				reservedEntryId: "reserved_recovery_entry",
+				lane: "follow_up",
+				message: {
+					role: "user",
+					content: [{ type: "text", text: "pending recovery input" }],
+					timestamp: Date.now(),
+				},
+			},
+		]);
+
+		expect(harness.session.hasPreparedManagedContinue).toBe(false);
+		expect(harness.session.messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"assistant",
+		]);
+		expect(harness.session.messages.filter((message) => message.role === "user")).toHaveLength(2);
+		expect(materialized).toEqual(["input_recovery"]);
+		expect(store.entries.map((entry) => entry.id)).toEqual([
+			"reserved_initial_continue_entry",
+			"host_entry_1",
+			"reserved_recovery_entry",
+			"host_entry_2",
+		]);
+		expect(
+			lifecycle
+				.filter((event) => event.type === "agent_event" && event.event.type === "agent_start")
+				.map((event) => event.activityToken),
+		).toEqual(["activity_continue_seed", "activity_continue_recovery"]);
 	});
 
 	it("rejects a managed initial prompt without a host-reserved Entry identity", async () => {

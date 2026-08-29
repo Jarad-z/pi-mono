@@ -21,6 +21,7 @@ export {
 	type ManagedAgentSessionFailStopSink,
 	type ManagedAgentSessionLifecycleEvent,
 	type ManagedAgentSessionLifecycleSink,
+	type ManagedContinueStartBatchItem,
 	type ManagedPromptOptions,
 	type ManagedPromptPreparation,
 	type ManagedPromptStartBatchItem,

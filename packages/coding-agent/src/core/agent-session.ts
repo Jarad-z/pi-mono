@@ -291,6 +291,11 @@ export interface ManagedPromptStartBatchItem {
 	message: AgentMessage;
 }
 
+/** A durable recovery message frozen into QueueMirror before transcript continuation starts. */
+export interface ManagedContinueStartBatchItem extends ManagedPromptStartBatchItem {
+	lane: "steer" | "follow_up";
+}
+
 /** Correlated lifecycle event delivered to the managed host before normal session observers. */
 export type ManagedAgentSessionLifecycleEvent =
 	| { type: "agent_event"; activityToken: string; event: AgentEvent }
@@ -392,6 +397,7 @@ export class AgentSession {
 	private _managedFailStopSequence = 0;
 	private _managedPromptPreparationToken: string | undefined;
 	private _preparedManagedPrompt: { activityToken: string; messages: AgentMessage[] } | undefined;
+	private _preparedManagedContinue: { activityToken: string } | undefined;
 	private _activeManagedActivityToken: string | undefined;
 	private _managedSettlementPending = false;
 	private readonly _usedManagedActivityTokens = new Set<string>();
@@ -790,6 +796,7 @@ export class AgentSession {
 		};
 		this._managedFailStopEvent = event;
 		this._preparedManagedPrompt = undefined;
+		this._preparedManagedContinue = undefined;
 		this.agent.abort();
 		this._compactionAbortController?.abort(failure);
 		this._autoCompactionAbortController?.abort(failure);
@@ -1325,12 +1332,12 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private async _runAgentInvocation(start: () => Promise<void>): Promise<void> {
 		this._isAgentRunActive = true;
 		let runFailed = false;
 		let runError: unknown;
 		try {
-			await this.agent.prompt(messages);
+			await start();
 			while (await this._handlePostAgentRun()) {
 				await this.agent.continue();
 			}
@@ -1355,6 +1362,14 @@ export class AgentSession {
 			}
 		}
 		if (runFailed) throw runError;
+	}
+
+	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._runAgentInvocation(() => this.agent.prompt(messages));
+	}
+
+	private async _runAgentContinue(): Promise<void> {
+		await this._runAgentInvocation(() => this.agent.continue());
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
@@ -1412,7 +1427,7 @@ export class AgentSession {
 		if (this._managedLifecycleSink) {
 			throw new Error("Managed lifecycle mode requires prepareManagedPrompt() followed by launchManagedPrompt()");
 		}
-		if (this._managedPromptPreparationToken || this._preparedManagedPrompt) {
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt || this._preparedManagedContinue) {
 			throw new Error("A managed prompt is already preparing or waiting for launch");
 		}
 		const messages = await this._preparePrompt(text, options);
@@ -1440,7 +1455,7 @@ export class AgentSession {
 		if (this.isStreaming || this._activeManagedActivityToken) {
 			throw new Error("A managed agent activity is already active");
 		}
-		if (this._managedPromptPreparationToken || this._preparedManagedPrompt) {
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt || this._preparedManagedContinue) {
 			throw new Error("A managed prompt is already preparing or waiting for launch");
 		}
 		if (this._usedManagedActivityTokens.has(activityToken)) {
@@ -1539,13 +1554,134 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Reserve a managed activity that will continue the existing transcript.
+	 * Recovery inputs are supplied only at launch, after the host commits its durable start barrier.
+	 */
+	async prepareManagedContinue(activityToken: string): Promise<ManagedPromptPreparation> {
+		this.assertManagedGenerationAvailable();
+		if (!this._managedLifecycleSink) {
+			throw new Error("Managed transcript continuation requires a managed lifecycle sink");
+		}
+		if (activityToken.trim().length === 0 || activityToken !== activityToken.trim()) {
+			throw new Error("Managed activity token must be a non-empty canonical string");
+		}
+		if (this.isStreaming || this._activeManagedActivityToken) {
+			throw new Error("A managed agent activity is already active");
+		}
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt || this._preparedManagedContinue) {
+			throw new Error("A managed prompt is already preparing or waiting for launch");
+		}
+		if (this._usedManagedActivityTokens.has(activityToken)) {
+			throw new Error(`Managed activity token ${activityToken} was already used`);
+		}
+		if (this.messages.length === 0) {
+			throw new Error("Managed transcript continuation requires an existing transcript");
+		}
+		if (
+			this.agent.hasQueuedMessages() ||
+			this.agent.hasManagedQueueItems() ||
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._pendingNextTurnMessages.length > 0
+		) {
+			throw new Error("Managed transcript continuation cannot start while queued messages remain");
+		}
+
+		this._usedManagedActivityTokens.add(activityToken);
+		this._managedPromptPreparationToken = activityToken;
+		try {
+			this._preparedManagedContinue = { activityToken };
+			return { outcome: "ready", activityToken };
+		} finally {
+			this._managedPromptPreparationToken = undefined;
+		}
+	}
+
+	/** Publish a frozen recovery batch and continue without replaying consumed transcript as a new prompt. */
+	async launchManagedContinue(
+		activityToken: string,
+		startBatch: readonly ManagedContinueStartBatchItem[],
+	): Promise<void> {
+		this.assertManagedGenerationAvailable();
+		const prepared = this._preparedManagedContinue;
+		if (!prepared || prepared.activityToken !== activityToken) {
+			throw new Error(`No prepared managed continuation exists for activity token ${activityToken}`);
+		}
+		if (this.isStreaming || this._activeManagedActivityToken) {
+			throw new Error("A managed agent activity is already active");
+		}
+		if (startBatch.length === 0) {
+			throw new Error("Managed transcript continuation requires a non-empty recovery batch");
+		}
+
+		const inputIds = new Set<string>();
+		const reservedEntryIds = new Set<string>();
+		for (const item of startBatch) {
+			if (item.inputId.trim().length === 0 || item.inputId !== item.inputId.trim()) {
+				throw new Error("Managed continuation input ID must be a non-empty canonical string");
+			}
+			if (item.reservedEntryId.trim().length === 0 || item.reservedEntryId !== item.reservedEntryId.trim()) {
+				throw new Error("Managed continuation reserved Entry ID must be a non-empty canonical string");
+			}
+			if (inputIds.has(item.inputId) || reservedEntryIds.has(item.reservedEntryId)) {
+				throw new Error("Managed continuation identities must be unique");
+			}
+			if (item.message.role !== "user") {
+				throw new Error("Managed continuation messages must be user messages");
+			}
+			inputIds.add(item.inputId);
+			reservedEntryIds.add(item.reservedEntryId);
+		}
+
+		this._preparedManagedContinue = undefined;
+		this._activeManagedActivityToken = activityToken;
+		try {
+			if (this.sessionManager.isManaged()) {
+				for (const item of startBatch) {
+					this.agent.registerManagedMessageEntryReservation(item.message, item.reservedEntryId);
+				}
+			}
+			this.agent.openManagedInputGate();
+			const tickets: ManagedQueueTicket[] = [];
+			for (const item of startBatch) {
+				const staged = this.agent.stageManagedQueueItem({
+					itemId: item.inputId,
+					lane: item.lane,
+					message: item.message,
+				});
+				if (staged.type === "gate_closed") {
+					throw new Error(`Managed continuation input gate closed at revision ${staged.gateRevision}`);
+				}
+				tickets.push(staged.ticket);
+			}
+			for (const ticket of tickets) {
+				if (this.agent.admitManagedQueueItem(ticket) === "stale") {
+					throw new Error(`Managed continuation input ${ticket.itemId} became stale before admission`);
+				}
+			}
+			for (const ticket of tickets) {
+				if (this.agent.publishManagedQueueItem(ticket) === "stale") {
+					throw new Error(`Managed continuation input ${ticket.itemId} became stale before publication`);
+				}
+			}
+			await this._runAgentContinue();
+		} finally {
+			this._activeManagedActivityToken = undefined;
+		}
+	}
+
 	/** Cancel a prepared prompt before launch. Returns false for a stale or different token. */
 	cancelManagedPrompt(activityToken: string): boolean {
 		this.assertManagedGenerationAvailable();
-		if (this._preparedManagedPrompt?.activityToken !== activityToken) {
+		if (
+			this._preparedManagedPrompt?.activityToken !== activityToken &&
+			this._preparedManagedContinue?.activityToken !== activityToken
+		) {
 			return false;
 		}
 		this._preparedManagedPrompt = undefined;
+		this._preparedManagedContinue = undefined;
 		this._systemPromptOverride = undefined;
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 		return true;
@@ -1553,7 +1689,12 @@ export class AgentSession {
 
 	/** Whether preflight has completed and a managed prompt is paused before launch. */
 	get hasPreparedManagedPrompt(): boolean {
-		return this._preparedManagedPrompt !== undefined;
+		return this._preparedManagedPrompt !== undefined || this._preparedManagedContinue !== undefined;
+	}
+
+	/** Whether transcript-continuation preflight is paused before launch. */
+	get hasPreparedManagedContinue(): boolean {
+		return this._preparedManagedContinue !== undefined;
 	}
 
 	/** Stage a stable managed queue item without making it drainable. */
