@@ -24,6 +24,7 @@ import {
 	isManagedAgentFailStopError,
 	ManagedAgentFailStopError,
 	type ManagedAgentFailStopPhase,
+	type ManagedProviderAttemptGateway,
 	type ManagedQueueAbortResult,
 	type ManagedQueueAdmissionResult,
 	type ManagedQueueItemInput,
@@ -248,6 +249,8 @@ export interface AgentSessionConfig {
 	managedExtensionHost?: ManagedExtensionHost;
 	/** Awaited, single-owner generation fence invoked for managed correctness-boundary failures. */
 	managedFailStopSink?: ManagedAgentSessionFailStopSink;
+	/** Durable Provider request/response journal installed with the managed lifecycle host. */
+	managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
 }
 
 export interface ExtensionBindings {
@@ -392,6 +395,7 @@ export class AgentSession {
 	private readonly _managedExtensionHost?: ManagedExtensionHost;
 	private readonly _managedFailureBindingProvider?: ManagedExtensionHost["getActivityBinding"];
 	private readonly _managedFailStopSink?: ManagedAgentSessionFailStopSink;
+	private readonly _managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
 	private _managedFailStopEvent: ManagedAgentSessionFailStopEvent | undefined;
 	private _managedFailStopPromise: Promise<void> | undefined;
 	private _managedFailStopSequence = 0;
@@ -477,6 +481,7 @@ export class AgentSession {
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._managedLifecycleSink = config.managedLifecycleSink;
 		this._managedFailStopSink = config.managedFailStopSink;
+		this._managedProviderAttemptGateway = config.managedProviderAttemptGateway;
 		this._managedFailureBindingProvider = config.managedExtensionHost?.getActivityBinding;
 		this._managedExtensionHost = config.managedExtensionHost
 			? {
@@ -504,6 +509,16 @@ export class AgentSession {
 		if (config.managedFailStopSink && !config.managedLifecycleSink) {
 			throw new Error("Managed fail-stop sink requires a managed lifecycle sink");
 		}
+		if (config.managedLifecycleSink && !config.managedProviderAttemptGateway) {
+			throw new Error("Managed lifecycle requires a managed ProviderAttempt gateway");
+		}
+		if (config.managedProviderAttemptGateway && !config.managedLifecycleSink) {
+			throw new Error("Managed ProviderAttempt gateway requires a managed lifecycle sink");
+		}
+		if (config.managedProviderAttemptGateway
+			&& this.agent.managedProviderAttemptGateway !== config.managedProviderAttemptGateway) {
+			throw new Error("Agent already has a different managed ProviderAttempt gateway");
+		}
 		if (config.managedQueueMaterializationHook && this.agent.hasQueuedMessages()) {
 			throw new Error("Managed queue materialization cannot adopt legacy queued messages");
 		}
@@ -528,10 +543,11 @@ export class AgentSession {
 			(!config.managedLifecycleSink ||
 				!this.agent.managedQueueMaterializationHook ||
 				!config.managedExtensionHost ||
-				!config.managedFailStopSink)
+				!config.managedFailStopSink ||
+				!config.managedProviderAttemptGateway)
 		) {
 			throw new Error(
-				"Managed SessionStore requires lifecycle, queue materialization, extension host, and fail-stop hooks",
+				"Managed SessionStore requires lifecycle, queue materialization, extension host, ProviderAttempt, and fail-stop hooks",
 			);
 		}
 
@@ -844,14 +860,14 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
-	private async _persistSessionMessage(message: AgentMessage): Promise<void> {
+	private async _persistSessionMessage(message: AgentMessage): Promise<string | undefined> {
 		const reservedEntryId = this.agent.takeManagedMessageEntryReservation(message);
 		if (this.sessionManager.isManaged() && message.role === "user" && !reservedEntryId) {
 			throw new Error("Managed user message has no host-reserved Entry identity");
 		}
 		if (message.role === "custom") {
 			if (this.sessionManager.isManaged()) {
-				await this.sessionManager.appendManagedCustomMessageEntry(
+				return await this.sessionManager.appendManagedCustomMessageEntry(
 					message.customType,
 					message.content,
 					message.display,
@@ -866,15 +882,15 @@ export class AgentSession {
 					message.details,
 				);
 			}
-			return;
+			return undefined;
 		}
 		if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
 			if (this.sessionManager.isManaged()) {
-				await this.sessionManager.appendManagedMessage(message, reservedEntryId);
+				return await this.sessionManager.appendManagedMessage(message, reservedEntryId);
 			} else {
 				this.sessionManager.appendMessage(message);
 			}
-			return;
+			return undefined;
 		}
 		if (reservedEntryId) {
 			throw new Error(`Managed Entry reservation cannot be applied to message role ${message.role}`);
@@ -915,8 +931,25 @@ export class AgentSession {
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
+		let managedEntryId: string | undefined;
 		if (event.type === "message_end" && this.sessionManager.isManaged()) {
-			await this._persistSessionMessage(event.message);
+			managedEntryId = await this._persistSessionMessage(event.message);
+			if (event.managedProviderAttempt) {
+				if (event.message.role !== "assistant" || !managedEntryId || !this._managedProviderAttemptGateway) {
+					throw await this.failStopManagedBoundary(
+						new Error("Managed ProviderAttempt response has no durable assistant Entry"),
+						"managed_host_boundary",
+					);
+				}
+				try {
+					await this._managedProviderAttemptGateway.settle(event.managedProviderAttempt, {
+						responseEntryId: managedEntryId,
+						response: event.message,
+					});
+				} catch (error) {
+					throw await this.failStopManagedBoundary(error, "managed_host_boundary");
+				}
+			}
 		}
 
 		// Notify all listeners
@@ -2554,6 +2587,11 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
+				if (this.sessionManager.isManaged()) {
+					throw new Error(
+						"Managed manual compaction requires a durable ProviderAttempt summary activity",
+					);
+				}
 				// Generate compaction result
 				const result = await compact(
 					preparation,
@@ -2844,6 +2882,11 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
+				if (this.sessionManager.isManaged()) {
+					throw new Error(
+						"Managed auto-compaction requires a durable ProviderAttempt summary activity",
+					);
+				}
 				// Generate compaction result
 				const compactResult = await compact(
 					preparation,
@@ -3758,6 +3801,11 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
+				if (this.sessionManager.isManaged()) {
+					throw new Error(
+						"Managed branch summary requires a durable ProviderAttempt summary activity",
+					);
+				}
 				const model = this.model!;
 				const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();

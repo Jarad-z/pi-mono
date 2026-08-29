@@ -2,6 +2,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AssistantMessage, createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai/compat";
+import type { ManagedProviderAttemptGateway } from "@earendil-works/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
@@ -118,6 +119,17 @@ describe("createAgentSession managed host composition", () => {
 		const queueBarrier = vi.fn(async () => []);
 		const lifecycleSink = vi.fn(async () => {});
 		const failStopSink = vi.fn(async () => {});
+		const providerAttemptGateway: ManagedProviderAttemptGateway = {
+			dispatch: async (request, execute) => ({
+				receipt: {
+					attemptId: `sdk-attempt-${request.requestId}`,
+					attemptVersion: 1,
+					purpose: request.purpose,
+				},
+				stream: await execute(),
+			}),
+			settle: async () => {},
+		};
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeTruthy();
 
@@ -129,6 +141,7 @@ describe("createAgentSession managed host composition", () => {
 			managedHost: {
 				managedLifecycleSink: lifecycleSink,
 				managedQueueMaterializationHook: queueBarrier,
+				managedProviderAttemptGateway: providerAttemptGateway,
 				managedExtensionHost: {
 					getActivityBinding: () => undefined,
 					dispatchExtensionAction: async (_request, execute) => execute(),
@@ -140,6 +153,7 @@ describe("createAgentSession managed host composition", () => {
 
 		expect(session.sessionManager).toBe(sessionManager);
 		expect(session.agent.managedQueueMaterializationHook).toBe(queueBarrier);
+		expect(session.agent.managedProviderAttemptGateway).toBe(providerAttemptGateway);
 		expect(session.agent.managedFailStopHandler).toBeTypeOf("function");
 		expect(store.reserve).not.toHaveBeenCalled();
 		expect(store.append).not.toHaveBeenCalled();
@@ -197,6 +211,22 @@ describe("createAgentSession managed host composition", () => {
 			[model.provider]: { type: "api_key", key: "managed-sdk-key" },
 		});
 		const modelRegistry = await createInMemoryModelRegistry(authStorage);
+		const providerAttemptGateway: ManagedProviderAttemptGateway = {
+			dispatch: async (request, execute) => {
+				order.push("provider-attempt:dispatched");
+				return {
+					receipt: {
+						attemptId: `sdk-attempt-${request.requestId}`,
+						attemptVersion: 1,
+						purpose: request.purpose,
+					},
+					stream: await execute(),
+				};
+			},
+			settle: async (receipt, result) => {
+				order.push(`provider-attempt:settled:${receipt.attemptId}:${result.responseEntryId}`);
+			},
+		};
 		modelRegistry.registerProvider(model.provider, {
 			api: model.api,
 			streamSimple: () => {
@@ -239,6 +269,7 @@ describe("createAgentSession managed host composition", () => {
 					order.push(`lifecycle:${eventType}${role ? `:${role}` : ""}`);
 				},
 				managedQueueMaterializationHook: async () => [],
+				managedProviderAttemptGateway: providerAttemptGateway,
 				managedExtensionHost: {
 					getActivityBinding: () => ({
 						generationId: "generation_sdk",
@@ -263,9 +294,13 @@ describe("createAgentSession managed host composition", () => {
 			await session.launchManagedPrompt("activity_sdk");
 
 			expect(store.entries.map((entry) => entry.id)).toEqual(["managed_sdk_initial_entry", "managed_sdk_entry_1"]);
+			expect(order).toContain("provider");
 			expect(order.indexOf("lifecycle:agent_start")).toBeLessThan(order.indexOf("provider"));
 			expect(order.indexOf("lifecycle:message_end:user")).toBeLessThan(order.indexOf("store:user"));
 			expect(order.indexOf("lifecycle:message_end:assistant")).toBeLessThan(order.indexOf("store:assistant"));
+			expect(order.indexOf("store:assistant")).toBeLessThan(
+				order.findIndex((item) => item.startsWith("provider-attempt:settled:sdk-attempt-1:managed_sdk_entry_1")),
+			);
 			expect(order.at(-1)).toBe("lifecycle:agent_settled");
 		} finally {
 			session.dispose();

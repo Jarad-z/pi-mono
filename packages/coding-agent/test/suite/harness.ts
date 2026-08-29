@@ -6,7 +6,12 @@ import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } fro
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool, ManagedQueueMaterializationHook } from "@earendil-works/pi-agent-core";
+import type {
+	AgentMessage,
+	AgentTool,
+	ManagedProviderAttemptGateway,
+	ManagedQueueMaterializationHook,
+} from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type {
 	FauxModelDefinition,
@@ -80,6 +85,7 @@ export interface HarnessOptions {
 	managedLifecycleSink?: ManagedAgentSessionLifecycleSink;
 	managedFailStopSink?: ManagedAgentSessionFailStopSink;
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
+	managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
 	managedExtensionHost?: ManagedExtensionHost;
 	sessionManager?: SessionManager;
 }
@@ -118,6 +124,20 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const managedProviderAttemptGateway = options.managedProviderAttemptGateway ??
+		(options.managedLifecycleSink
+			? {
+					dispatch: async (request, execute) => ({
+						receipt: {
+							attemptId: `test-provider-attempt-${request.requestId}`,
+							attemptVersion: 1,
+							purpose: request.purpose,
+						},
+						stream: await execute(),
+					}),
+					settle: async () => {},
+				} satisfies ManagedProviderAttemptGateway
+			: undefined);
 
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
@@ -182,6 +202,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			if (!runner) return messages;
 			return runner.emitContext(messages);
 		},
+		managedProviderAttemptGateway,
 	});
 	const extensionsResult = options.extensionFactories
 		? await createTestExtensionsResult(options.extensionFactories, tempDir)
@@ -204,6 +225,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		managedLifecycleSink: options.managedLifecycleSink,
 		managedFailStopSink: options.managedFailStopSink,
 		managedQueueMaterializationHook: options.managedQueueMaterializationHook,
+		managedProviderAttemptGateway,
 		managedExtensionHost: options.managedExtensionHost,
 	});
 

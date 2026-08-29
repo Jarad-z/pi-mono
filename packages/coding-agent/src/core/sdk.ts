@@ -87,7 +87,11 @@ export interface CreateAgentSessionOptions {
 	/** Complete managed-host bridge. Must be paired with SessionManager.managed(). */
 	managedHost?: Pick<
 		AgentSessionConfig,
-		"managedLifecycleSink" | "managedQueueMaterializationHook" | "managedExtensionHost" | "managedFailStopSink"
+		| "managedLifecycleSink"
+		| "managedQueueMaterializationHook"
+		| "managedExtensionHost"
+		| "managedProviderAttemptGateway"
+		| "managedFailStopSink"
 	>;
 }
 
@@ -341,6 +345,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				},
 			});
 		},
+		managedProviderAttemptGateway: options.managedHost?.managedProviderAttemptGateway,
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {

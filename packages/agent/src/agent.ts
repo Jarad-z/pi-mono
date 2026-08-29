@@ -22,6 +22,7 @@ import type {
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	ManagedAgentFailStopHandler,
+	ManagedProviderAttemptGateway,
 	ManagedQueueAbortResult,
 	ManagedQueueAdmissionResult,
 	ManagedQueueItemInput,
@@ -134,6 +135,8 @@ export interface AgentOptions {
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 	/** Awaited generation fail-stop bridge for managed correctness-boundary failures. */
 	managedFailStopHandler?: ManagedAgentFailStopHandler;
+	/** Durable Provider request/response gateway for managed Agent loops. */
+	managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
 	sessionId?: string;
 	thinkingBudgets?: ThinkingBudgets;
 	transport?: Transport;
@@ -276,6 +279,8 @@ export class Agent {
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	public managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 	public managedFailStopHandler?: ManagedAgentFailStopHandler;
+	public managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
+	private managedProviderRequestSequence = 0;
 	private activeRun?: ActiveRun;
 	private activeRunHasStarted = false;
 	private activeRunTurnOpen = false;
@@ -307,6 +312,7 @@ export class Agent {
 		this.prepareNextTurnWithContext = runtimeOptions.prepareNextTurnWithContext;
 		this.managedQueueMaterializationHook = runtimeOptions.managedQueueMaterializationHook;
 		this.managedFailStopHandler = runtimeOptions.managedFailStopHandler;
+		this.managedProviderAttemptGateway = runtimeOptions.managedProviderAttemptGateway;
 		this.steeringQueue = new PendingMessageQueue(runtimeOptions.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(runtimeOptions.followUpMode ?? "one-at-a-time");
 		this.sessionId = runtimeOptions.sessionId;
@@ -788,6 +794,7 @@ export class Agent {
 		signal: AbortSignal,
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
+		this.managedProviderRequestSequence = 0;
 		await runAgentLoop(
 			messages,
 			this.createContextSnapshot(),
@@ -800,6 +807,7 @@ export class Agent {
 
 	private async runContinuation(): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
+			this.managedProviderRequestSequence = 0;
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
 				this.createLoopConfig(signal),
@@ -823,6 +831,10 @@ export class Agent {
 		const shouldStopAfterTurn = this.shouldStopAfterTurn;
 		return {
 			model: this._state.model,
+			managedProviderAttemptGateway: this.managedProviderAttemptGateway,
+			nextManagedProviderRequestId: this.managedProviderAttemptGateway
+				? () => String(++this.managedProviderRequestSequence)
+				: undefined,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,
 			onPayload: this.onPayload,

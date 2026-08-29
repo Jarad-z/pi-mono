@@ -21,7 +21,7 @@ import type {
 	AgentToolResult,
 	StreamFn,
 } from "./types.ts";
-import { isManagedAgentFailStopError } from "./types.ts";
+import { isManagedAgentFailStopError, ManagedAgentFailStopError } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
@@ -306,11 +306,39 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
-	const response = await streamFunction(config.model, llmContext, {
+	const streamOptions = {
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
-	});
+	};
+	delete streamOptions.managedProviderAttemptGateway;
+	delete streamOptions.nextManagedProviderRequestId;
+	const gateway = config.managedProviderAttemptGateway;
+	let dispatched;
+	try {
+		dispatched = gateway
+			? await gateway.dispatch(
+				{
+					requestId: config.nextManagedProviderRequestId?.() ?? "1",
+					purpose: "run_core",
+					modelProvider: config.model.provider,
+					modelId: config.model.id,
+					modelApi: config.model.api,
+					context: llmContext,
+					options: streamOptions,
+				},
+				() => streamFunction(config.model, llmContext, streamOptions),
+			)
+			: undefined;
+	} catch (error) {
+		if (isManagedAgentFailStopError(error)) throw error;
+		throw new ManagedAgentFailStopError(
+			"managed_host_boundary",
+			`Managed ProviderAttempt dispatch failed: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
+	}
+	const response = dispatched?.stream ?? (await streamFunction(config.model, llmContext, streamOptions));
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
@@ -355,7 +383,11 @@ async function streamAssistantResponse(
 				if (!addedPartial) {
 					await emit({ type: "message_start", message: { ...finalMessage } });
 				}
-				await emit({ type: "message_end", message: finalMessage });
+				await emit({
+					type: "message_end",
+					message: finalMessage,
+					...(dispatched ? { managedProviderAttempt: dispatched.receipt } : {}),
+				});
 				return finalMessage;
 			}
 		}
@@ -368,7 +400,11 @@ async function streamAssistantResponse(
 		context.messages.push(finalMessage);
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
-	await emit({ type: "message_end", message: finalMessage });
+	await emit({
+		type: "message_end",
+		message: finalMessage,
+		...(dispatched ? { managedProviderAttempt: dispatched.receipt } : {}),
+	});
 	return finalMessage;
 }
 

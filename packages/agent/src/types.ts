@@ -31,6 +31,53 @@ export type StreamFn = (
 	options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
+export type ManagedProviderAttemptPurpose =
+	| "run_core"
+	| "auto_compaction"
+	| "manual_compaction"
+	| "branch_summary"
+	| "maintenance";
+
+/** Transient request data presented to the durable host; raw payloads must not be persisted. */
+export interface ManagedProviderAttemptRequest {
+	readonly requestId: string;
+	readonly purpose: ManagedProviderAttemptPurpose;
+	readonly modelProvider: string;
+	readonly modelId: string;
+	readonly modelApi: string;
+	readonly context: Context;
+	readonly options?: SimpleStreamOptions;
+}
+
+/** Opaque durable attempt receipt carried through message persistence. */
+export interface ManagedProviderAttemptReceipt {
+	readonly attemptId: string;
+	readonly attemptVersion: number;
+	readonly purpose: ManagedProviderAttemptPurpose;
+}
+
+export interface ManagedProviderAttemptDispatch {
+	readonly receipt: ManagedProviderAttemptReceipt;
+	readonly stream: AssistantMessageEventStream;
+}
+
+export interface ManagedProviderAttemptSettlement {
+	readonly responseEntryId: string;
+	readonly response: AssistantMessage;
+}
+
+/** Durable boundary immediately before Provider visibility and after response Entry commit. */
+export interface ManagedProviderAttemptGateway {
+	dispatch(
+		request: ManagedProviderAttemptRequest,
+		execute: () => AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
+	): Promise<ManagedProviderAttemptDispatch>;
+	settle(
+		receipt: ManagedProviderAttemptReceipt,
+		settlement: ManagedProviderAttemptSettlement,
+	): Promise<void>;
+}
+
 /**
  * Configuration for how tool calls from a single assistant message are executed.
  *
@@ -260,6 +307,9 @@ export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	/** Managed Provider journal installed together with the managed lifecycle host. */
+	managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
+	nextManagedProviderRequestId?: () => string;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -548,7 +598,11 @@ export type AgentEvent =
 	| { type: "message_start"; message: AgentMessage }
 	// Only emitted for assistant messages during streaming
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
-	| { type: "message_end"; message: AgentMessage }
+	| {
+			type: "message_end";
+			message: AgentMessage;
+			managedProviderAttempt?: ManagedProviderAttemptReceipt;
+	  }
 	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }

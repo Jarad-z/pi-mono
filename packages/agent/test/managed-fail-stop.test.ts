@@ -1,7 +1,14 @@
 import { type AssistantMessage, type AssistantMessageEvent, EventStream } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
-import { Agent, type AgentMessage, type AgentTool, ManagedAgentFailStopError, type StreamFn } from "../src/index.ts";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentTool,
+	ManagedAgentFailStopError,
+	type ManagedProviderAttemptGateway,
+	type StreamFn,
+} from "../src/index.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor(message: AssistantMessage) {
@@ -42,6 +49,70 @@ function user(text: string): AgentMessage {
 }
 
 describe("managed Agent fail-stop", () => {
+	it("dispatches through the managed ProviderAttempt gateway and attaches its receipt", async () => {
+		const order: string[] = [];
+		const streamFn = vi.fn<StreamFn>(() => {
+			order.push("provider");
+			return new MockAssistantStream(assistant([{ type: "text", text: "done" }]));
+		});
+		const gateway: ManagedProviderAttemptGateway = {
+			dispatch: async (request, execute) => {
+				order.push(`dispatch:${request.requestId}:${request.purpose}`);
+				return {
+					receipt: {
+						attemptId: "provider-attempt-1",
+						attemptVersion: 1,
+						purpose: request.purpose,
+					},
+					stream: execute(),
+				};
+			},
+			settle: async () => {
+				throw new Error("Agent core must not settle ProviderAttempts");
+			},
+		};
+		const agent = new Agent({ streamFn, managedProviderAttemptGateway: gateway });
+		let receipt: unknown;
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				receipt = event.managedProviderAttempt;
+			}
+		});
+
+		await agent.prompt("hello");
+
+		expect(order).toEqual(["dispatch:1:run_core", "provider"]);
+		expect(receipt).toEqual({
+			attemptId: "provider-attempt-1",
+			attemptVersion: 1,
+			purpose: "run_core",
+		});
+	});
+
+	it("fail-stops before Provider visibility when ProviderAttempt dispatch rejects", async () => {
+		const streamFn = vi.fn<StreamFn>(() => new MockAssistantStream(assistant([{ type: "text", text: "unused" }])));
+		const failures: ManagedAgentFailStopError[] = [];
+		const agent = new Agent({
+			streamFn,
+			managedProviderAttemptGateway: {
+				dispatch: async () => {
+					throw new Error("durable ProviderAttempt dispatch rejected");
+				},
+				settle: async () => {},
+			},
+			managedFailStopHandler: async (failure) => {
+				failures.push(failure);
+			},
+		});
+
+		await expect(agent.prompt("hello")).rejects.toMatchObject({
+			name: "ManagedAgentFailStopError",
+			phase: "managed_host_boundary",
+		});
+		expect(streamFn).not.toHaveBeenCalled();
+		expect(failures).toHaveLength(1);
+	});
+
 	it("fails the generation once when an awaited lifecycle listener rejects", async () => {
 		const streamFn = vi.fn<StreamFn>(() => new MockAssistantStream(assistant([{ type: "text", text: "unused" }])));
 		const failures: ManagedAgentFailStopError[] = [];
