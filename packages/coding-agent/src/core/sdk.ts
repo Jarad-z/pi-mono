@@ -91,6 +91,7 @@ export interface CreateAgentSessionOptions {
 		| "managedQueueMaterializationHook"
 		| "managedExtensionHost"
 		| "managedProviderAttemptGateway"
+		| "managedAutoCompactionGateway"
 		| "managedFailStopSink"
 	>;
 }

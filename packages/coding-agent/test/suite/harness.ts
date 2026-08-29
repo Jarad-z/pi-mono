@@ -25,6 +25,7 @@ import {
 	type AgentSessionEvent,
 	type ManagedAgentSessionFailStopSink,
 	type ManagedAgentSessionLifecycleSink,
+	type ManagedAutoCompactionGateway,
 } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionRunner, ManagedExtensionHost } from "../../src/core/extensions/index.ts";
@@ -86,6 +87,7 @@ export interface HarnessOptions {
 	managedFailStopSink?: ManagedAgentSessionFailStopSink;
 	managedQueueMaterializationHook?: ManagedQueueMaterializationHook;
 	managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
+	managedAutoCompactionGateway?: ManagedAutoCompactionGateway;
 	managedExtensionHost?: ManagedExtensionHost;
 	sessionManager?: SessionManager;
 }
@@ -124,9 +126,10 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const toolMap = options.tools ? Object.fromEntries(options.tools.map((tool) => [tool.name, tool])) : undefined;
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
-	const managedProviderAttemptGateway = options.managedProviderAttemptGateway ??
+	const managedProviderAttemptGateway =
+		options.managedProviderAttemptGateway ??
 		(options.managedLifecycleSink
-			? {
+			? ({
 					dispatch: async (request, execute) => ({
 						receipt: {
 							attemptId: `test-provider-attempt-${request.requestId}`,
@@ -136,7 +139,18 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 						stream: await execute(),
 					}),
 					settle: async () => {},
-				} satisfies ManagedProviderAttemptGateway
+				} satisfies ManagedProviderAttemptGateway)
+			: undefined);
+	const managedAutoCompactionGateway =
+		options.managedAutoCompactionGateway ??
+		(options.managedLifecycleSink
+			? ({
+					begin: async () => {
+						throw new Error("Managed auto-compaction was not configured for this test");
+					},
+					complete: async () => {},
+					fail: async () => {},
+				} satisfies ManagedAutoCompactionGateway)
 			: undefined);
 
 	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
@@ -226,6 +240,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		managedFailStopSink: options.managedFailStopSink,
 		managedQueueMaterializationHook: options.managedQueueMaterializationHook,
 		managedProviderAttemptGateway,
+		managedAutoCompactionGateway,
 		managedExtensionHost: options.managedExtensionHost,
 	});
 

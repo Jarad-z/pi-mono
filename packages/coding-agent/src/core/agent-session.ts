@@ -252,6 +252,8 @@ export interface AgentSessionConfig {
 	managedFailStopSink?: ManagedAgentSessionFailStopSink;
 	/** Durable Provider request/response journal installed with the managed lifecycle host. */
 	managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
+	/** Active-Run to child-maintenance handoff for managed automatic compaction. */
+	managedAutoCompactionGateway?: ManagedAutoCompactionGateway;
 }
 
 export interface ExtensionBindings {
@@ -294,6 +296,24 @@ export interface ManagedCompactionOptions {
 	reservedEntryId: string;
 	requestIdPrefix?: string;
 	customInstructions?: string;
+}
+
+/** Durable child-maintenance owner used by in-Run managed auto-compaction. */
+export interface ManagedAutoCompactionHandle {
+	activityToken: string;
+	reservedEntryId: string;
+	requestIdPrefix?: string;
+}
+
+export interface ManagedAutoCompactionGateway {
+	begin(input: {
+		parentActivityToken: string;
+		reason: "overflow" | "threshold";
+		willRetry: boolean;
+		capturedLeafId: string | null;
+	}): Promise<ManagedAutoCompactionHandle>;
+	complete(handle: ManagedAutoCompactionHandle, outcome: { summaryEntryId: string }): Promise<void>;
+	fail(handle: ManagedAutoCompactionHandle, outcome: { error: unknown; aborted: boolean }): Promise<void>;
 }
 
 /** Options shared by legacy and managed in-session tree navigation. */
@@ -420,6 +440,7 @@ export class AgentSession {
 	private readonly _managedFailureBindingProvider?: ManagedExtensionHost["getActivityBinding"];
 	private readonly _managedFailStopSink?: ManagedAgentSessionFailStopSink;
 	private readonly _managedProviderAttemptGateway?: ManagedProviderAttemptGateway;
+	private readonly _managedAutoCompactionGateway?: ManagedAutoCompactionGateway;
 	private _managedFailStopEvent: ManagedAgentSessionFailStopEvent | undefined;
 	private _managedFailStopPromise: Promise<void> | undefined;
 	private _managedFailStopSequence = 0;
@@ -506,6 +527,7 @@ export class AgentSession {
 		this._managedLifecycleSink = config.managedLifecycleSink;
 		this._managedFailStopSink = config.managedFailStopSink;
 		this._managedProviderAttemptGateway = config.managedProviderAttemptGateway;
+		this._managedAutoCompactionGateway = config.managedAutoCompactionGateway;
 		this._managedFailureBindingProvider = config.managedExtensionHost?.getActivityBinding;
 		this._managedExtensionHost = config.managedExtensionHost
 			? {
@@ -539,6 +561,12 @@ export class AgentSession {
 		if (config.managedProviderAttemptGateway && !config.managedLifecycleSink) {
 			throw new Error("Managed ProviderAttempt gateway requires a managed lifecycle sink");
 		}
+		if (config.managedLifecycleSink && !config.managedAutoCompactionGateway) {
+			throw new Error("Managed lifecycle requires a managed auto-compaction gateway");
+		}
+		if (config.managedAutoCompactionGateway && !config.managedLifecycleSink) {
+			throw new Error("Managed auto-compaction gateway requires a managed lifecycle sink");
+		}
 		if (
 			config.managedProviderAttemptGateway &&
 			this.agent.managedProviderAttemptGateway !== config.managedProviderAttemptGateway
@@ -570,10 +598,11 @@ export class AgentSession {
 				!this.agent.managedQueueMaterializationHook ||
 				!config.managedExtensionHost ||
 				!config.managedFailStopSink ||
-				!config.managedProviderAttemptGateway)
+				!config.managedProviderAttemptGateway ||
+				!config.managedAutoCompactionGateway)
 		) {
 			throw new Error(
-				"Managed SessionStore requires lifecycle, queue materialization, extension host, ProviderAttempt, and fail-stop hooks",
+				"Managed SessionStore requires lifecycle, queue materialization, extension host, ProviderAttempt, auto-compaction, and fail-stop hooks",
 			);
 		}
 
@@ -2974,6 +3003,11 @@ export class AgentSession {
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
+		let managedStartAttempted = false;
+		let managedParentActivityToken: string | undefined;
+		let managedHandoff: ManagedAutoCompactionHandle | undefined;
+		let managedHandoffCompleted = false;
+		let managed: ManagedSummarizationContext | undefined;
 
 		try {
 			if (!this.model) {
@@ -2992,6 +3026,57 @@ export class AgentSession {
 			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
+
+			if (this.sessionManager.isManaged()) {
+				const gateway = this._managedAutoCompactionGateway;
+				managedParentActivityToken = this._activeManagedActivityToken;
+				if (!gateway || !managedParentActivityToken) {
+					throw new Error("Managed auto-compaction has no active parent Run gateway");
+				}
+				managedStartAttempted = true;
+				managedHandoff = await gateway.begin({
+					parentActivityToken: managedParentActivityToken,
+					reason,
+					willRetry,
+					capturedLeafId: this.sessionManager.getLeafId(),
+				});
+				for (const [label, value] of Object.entries({
+					activityToken: managedHandoff.activityToken,
+					reservedEntryId: managedHandoff.reservedEntryId,
+					requestIdPrefix: managedHandoff.requestIdPrefix ?? `${managedHandoff.activityToken}:summary`,
+				})) {
+					if (value.trim().length === 0 || value !== value.trim()) {
+						throw new Error(`Managed auto-compaction ${label} must be a non-empty canonical string`);
+					}
+				}
+				if (
+					managedHandoff.activityToken === managedParentActivityToken ||
+					this._usedManagedActivityTokens.has(managedHandoff.activityToken)
+				) {
+					throw new Error(
+						`Managed auto-compaction activity token was already used: ${managedHandoff.activityToken}`,
+					);
+				}
+				this._usedManagedActivityTokens.add(managedHandoff.activityToken);
+				this._activeManagedActivityToken = managedHandoff.activityToken;
+				const binding = this._managedExtensionHost?.getActivityBinding();
+				if (
+					!binding ||
+					binding.activityToken !== managedHandoff.activityToken ||
+					binding.runId !== undefined ||
+					binding.coreInvocationId !== undefined ||
+					!binding.maintenanceActivityId ||
+					!binding.maintenanceCoreId
+				) {
+					throw new Error(
+						`Managed auto-compaction has no bound maintenance Core: ${managedHandoff.activityToken}`,
+					);
+				}
+				managed = this._createManagedSummarizationContext(
+					"auto_compaction",
+					managedHandoff.requestIdPrefix ?? `${managedHandoff.activityToken}:summary`,
+				);
+			}
 
 			let extensionCompaction: CompactionResult | undefined;
 			let fromExtension = false;
@@ -3038,9 +3123,6 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				if (this.sessionManager.isManaged()) {
-					throw new Error("Managed auto-compaction requires a durable ProviderAttempt summary activity");
-				}
 				// Generate compaction result
 				const compactResult = await compact(
 					preparation,
@@ -3054,6 +3136,7 @@ export class AgentSession {
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason }),
+					managed,
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
@@ -3073,14 +3156,16 @@ export class AgentSession {
 				return false;
 			}
 
-			if (this.sessionManager.isManaged()) {
-				await this.sessionManager.appendManagedCompaction(
+			let committedEntryId: string | undefined;
+			if (managedHandoff) {
+				committedEntryId = await this.sessionManager.appendManagedCompaction(
 					summary,
 					firstKeptEntryId,
 					tokensBefore,
 					details,
 					fromExtension,
 					usage,
+					managedHandoff.reservedEntryId,
 				);
 			} else {
 				this.sessionManager.appendCompaction(
@@ -3091,6 +3176,14 @@ export class AgentSession {
 					fromExtension,
 					usage,
 				);
+			}
+			if (managed && managedHandoff && committedEntryId) {
+				await this._settleManagedSummarizationCompleted(managed, committedEntryId);
+				await this._managedAutoCompactionGateway!.complete(managedHandoff, {
+					summaryEntryId: committedEntryId,
+				});
+				managedHandoffCompleted = true;
+				this._activeManagedActivityToken = managedParentActivityToken;
 			}
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -3139,7 +3232,40 @@ export class AgentSession {
 			// Continue once so queued messages are delivered.
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			let caughtError = error;
+			if (managed && managed.completedAttempts.length > 0) {
+				try {
+					await this._settleManagedSummarizationFailed(managed, caughtError);
+				} catch (settlementError) {
+					caughtError = new AggregateError(
+						[caughtError, settlementError],
+						"Managed auto-compaction failed and ProviderAttempt settlement also failed",
+					);
+				}
+			}
+			if (managedHandoff && !managedHandoffCompleted) {
+				try {
+					await this._managedAutoCompactionGateway!.fail(managedHandoff, {
+						error: caughtError,
+						aborted: this._autoCompactionAbortController?.signal.aborted ?? false,
+					});
+					this._activeManagedActivityToken = managedParentActivityToken;
+				} catch (handoffError) {
+					caughtError = new AggregateError(
+						[caughtError, handoffError],
+						"Managed auto-compaction failed and its parent Run could not be restored",
+					);
+				}
+			}
+			if (
+				this.sessionManager.isManaged() &&
+				(managedHandoffCompleted ||
+					(managedStartAttempted &&
+						(!managedHandoff || this._activeManagedActivityToken !== managedParentActivityToken)))
+			) {
+				throw await this.failStopManagedBoundary(caughtError, "managed_host_boundary");
+			}
+			const errorMessage = caughtError instanceof Error ? caughtError.message : "compaction failed";
 			if (started) {
 				this._emit({
 					type: "compaction_end",
@@ -3155,6 +3281,9 @@ export class AgentSession {
 			}
 			return false;
 		} finally {
+			if (managedParentActivityToken) {
+				this._activeManagedActivityToken = managedParentActivityToken;
+			}
 			this._autoCompactionAbortController = undefined;
 		}
 	}

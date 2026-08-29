@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ManagedProviderAttemptGateway } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, createAssistantMessageEventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ManagedAutoCompactionGateway } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import {
@@ -16,6 +17,14 @@ import {
 	SessionManager,
 } from "../src/core/session-manager.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
+
+const unusedAutoCompactionGateway: ManagedAutoCompactionGateway = {
+	begin: async () => {
+		throw new Error("Unexpected managed auto-compaction");
+	},
+	complete: async () => {},
+	fail: async () => {},
+};
 
 class EmptyManagedStore implements ManagedSessionStore {
 	readonly load = vi.fn(
@@ -142,6 +151,7 @@ describe("createAgentSession managed host composition", () => {
 				managedLifecycleSink: lifecycleSink,
 				managedQueueMaterializationHook: queueBarrier,
 				managedProviderAttemptGateway: providerAttemptGateway,
+				managedAutoCompactionGateway: unusedAutoCompactionGateway,
 				managedExtensionHost: {
 					getActivityBinding: () => undefined,
 					dispatchExtensionAction: async (_request, execute) => execute(),
@@ -270,6 +280,7 @@ describe("createAgentSession managed host composition", () => {
 				},
 				managedQueueMaterializationHook: async () => [],
 				managedProviderAttemptGateway: providerAttemptGateway,
+				managedAutoCompactionGateway: unusedAutoCompactionGateway,
 				managedExtensionHost: {
 					getActivityBinding: () => ({
 						generationId: "generation_sdk",
@@ -413,6 +424,7 @@ describe("createAgentSession managed host composition", () => {
 				managedLifecycleSink: async () => {},
 				managedQueueMaterializationHook: async () => [],
 				managedProviderAttemptGateway: providerAttemptGateway,
+				managedAutoCompactionGateway: unusedAutoCompactionGateway,
 				managedExtensionHost: {
 					getActivityBinding: () => ({
 						generationId: "generation_sdk",
@@ -446,6 +458,192 @@ describe("createAgentSession managed host composition", () => {
 					"provider-attempt:settled:sdk-maintenance-maintenance_sdk:summary:1:completed:entry-managed-compaction",
 				),
 			);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
+
+	it("hands an active managed Run to auto-compaction and restores it after the reserved Entry commits", async () => {
+		const order: string[] = [];
+		const store = new RecordingManagedStore(order);
+		const message = (
+			id: string,
+			parentId: string | null,
+			role: "user" | "assistant",
+			text: string,
+		): SessionEntry => ({
+			type: "message",
+			id,
+			parentId,
+			timestamp: "2026-08-29T00:00:00.000Z",
+			message:
+				role === "user"
+					? { role, content: [{ type: "text", text }], timestamp: 1 }
+					: {
+							role,
+							content: [{ type: "text", text }],
+							api: "anthropic-messages",
+							provider: "anthropic",
+							model: "claude-sonnet-4-5",
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: 1,
+						},
+		});
+		store.entries.push(
+			message("auto-entry-1", null, "user", "old request ".repeat(10_000)),
+			message("auto-entry-2", "auto-entry-1", "assistant", "old result"),
+			message("auto-entry-3", "auto-entry-2", "user", "middle request ".repeat(10_000)),
+			message("auto-entry-4", "auto-entry-3", "assistant", "middle result"),
+			message("auto-entry-5", "auto-entry-4", "user", "recent request"),
+			message("auto-entry-6", "auto-entry-5", "assistant", "recent result"),
+		);
+		store.leafId = "auto-entry-6";
+		const sessionManager = await SessionManager.managed(store);
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Managed SDK test model is unavailable");
+		const authStorage = AuthStorage.inMemory({
+			[model.provider]: { type: "api_key", key: "managed-sdk-key" },
+		});
+		const modelRegistry = await createInMemoryModelRegistry(authStorage);
+		modelRegistry.registerProvider(model.provider, {
+			api: model.api,
+			streamSimple: () => {
+				order.push("provider");
+				const stream = createAssistantMessageEventStream();
+				stream.end({
+					role: "assistant",
+					content: [{ type: "text", text: "managed automatic summary" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 10,
+						output: 5,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 15,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+				return stream;
+			},
+		});
+		let hostActivityToken = "auto-parent-activity";
+		const providerAttemptGateway: ManagedProviderAttemptGateway = {
+			dispatch: async (request, execute) => {
+				order.push(`provider-attempt:dispatch:${request.purpose}:${hostActivityToken}`);
+				return {
+					receipt: {
+						attemptId: `sdk-auto-${request.requestId}`,
+						attemptVersion: 1,
+						purpose: request.purpose,
+					},
+					stream: await execute(),
+				};
+			},
+			settle: async (_receipt, settlement) => {
+				order.push(`provider-attempt:settle:${settlement.status}:${settlement.responseEntryId ?? "none"}`);
+			},
+		};
+		const autoCompactionGateway: ManagedAutoCompactionGateway = {
+			begin: async (input) => {
+				order.push(`auto:begin:${input.parentActivityToken}:${input.capturedLeafId}`);
+				store.reserved.add("entry-managed-auto-compaction");
+				hostActivityToken = "auto-child-activity";
+				return {
+					activityToken: hostActivityToken,
+					reservedEntryId: "entry-managed-auto-compaction",
+					requestIdPrefix: "auto-child-summary",
+				};
+			},
+			complete: async (_handle, outcome) => {
+				order.push(`auto:complete:${outcome.summaryEntryId}`);
+				hostActivityToken = "auto-parent-activity";
+			},
+			fail: async (_handle, outcome) => {
+				order.push(`auto:fail:${outcome.aborted}`);
+				hostActivityToken = "auto-parent-activity";
+			},
+		};
+		const failStopSink = vi.fn(async () => {});
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			model,
+			modelRuntime: getModelRuntime(modelRegistry),
+			noTools: "all",
+			sessionManager,
+			managedHost: {
+				managedLifecycleSink: async () => {},
+				managedQueueMaterializationHook: async () => [],
+				managedProviderAttemptGateway: providerAttemptGateway,
+				managedAutoCompactionGateway: autoCompactionGateway,
+				managedExtensionHost: {
+					getActivityBinding: () =>
+						hostActivityToken === "auto-child-activity"
+							? {
+									generationId: "generation_sdk",
+									generationLeaseToken: "lease_sdk",
+									activityToken: hostActivityToken,
+									maintenanceActivityId: "auto-maintenance-activity",
+									maintenanceCoreId: "auto-maintenance-core",
+								}
+							: {
+									generationId: "generation_sdk",
+									generationLeaseToken: "lease_sdk",
+									activityToken: hostActivityToken,
+									runId: "auto-parent-run",
+									coreInvocationId: "auto-parent-core",
+								},
+					dispatchExtensionAction: async (_request, execute) => execute(),
+					executeTool: async (_scope, execute) => execute(),
+				},
+				managedFailStopSink: failStopSink,
+			},
+		});
+
+		try {
+			const privateSession = session as unknown as {
+				_activeManagedActivityToken: string | undefined;
+				_runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean>;
+			};
+			privateSession._activeManagedActivityToken = "auto-parent-activity";
+			await expect(privateSession._runAutoCompaction("threshold", false)).resolves.toBe(false);
+			expect(privateSession._activeManagedActivityToken).toBe("auto-parent-activity");
+			expect(hostActivityToken).toBe("auto-parent-activity");
+			expect(store.entries.at(-1)).toMatchObject({
+				type: "compaction",
+				id: "entry-managed-auto-compaction",
+				parentId: "auto-entry-6",
+			});
+			expect(order).toEqual(
+				expect.arrayContaining([
+					"auto:begin:auto-parent-activity:auto-entry-6",
+					"provider-attempt:dispatch:auto_compaction:auto-child-activity",
+					"store:compaction",
+					"provider-attempt:settle:completed:entry-managed-auto-compaction",
+					"auto:complete:entry-managed-auto-compaction",
+				]),
+			);
+			expect(order.indexOf("store:compaction")).toBeLessThan(
+				order.indexOf("provider-attempt:settle:completed:entry-managed-auto-compaction"),
+			);
+			expect(order.indexOf("provider-attempt:settle:completed:entry-managed-auto-compaction")).toBeLessThan(
+				order.indexOf("auto:complete:entry-managed-auto-compaction"),
+			);
+			expect(order.some((item) => item.startsWith("auto:fail"))).toBe(false);
+			expect(failStopSink).not.toHaveBeenCalled();
 		} finally {
 			session.dispose();
 			modelRegistry.unregisterProvider(model.provider);
@@ -555,6 +753,7 @@ describe("createAgentSession managed host composition", () => {
 				managedLifecycleSink: async () => {},
 				managedQueueMaterializationHook: async () => [],
 				managedProviderAttemptGateway: providerAttemptGateway,
+				managedAutoCompactionGateway: unusedAutoCompactionGateway,
 				managedExtensionHost: {
 					getActivityBinding: () => ({
 						generationId: "generation_sdk",
