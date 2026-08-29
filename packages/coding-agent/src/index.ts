@@ -21,15 +21,18 @@ export {
 	type ManagedAgentSessionFailStopSink,
 	type ManagedAgentSessionLifecycleEvent,
 	type ManagedAgentSessionLifecycleSink,
+	type ManagedCompactionOptions,
 	type ManagedContinueStartBatchItem,
 	type ManagedPromptOptions,
 	type ManagedPromptPreparation,
 	type ManagedPromptStartBatchItem,
+	type ManagedTreeNavigationOptions,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,
 	parseSkillBlock,
 	type SessionStats,
+	type TreeNavigationOptions,
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
 // Compaction

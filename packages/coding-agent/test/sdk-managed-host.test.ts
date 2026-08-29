@@ -451,4 +451,149 @@ describe("createAgentSession managed host composition", () => {
 			modelRegistry.unregisterProvider(model.provider);
 		}
 	});
+
+	it("commits a managed branch summary below the navigation target while fencing the old leaf", async () => {
+		const order: string[] = [];
+		const store = new RecordingManagedStore(order);
+		const message = (
+			id: string,
+			parentId: string | null,
+			role: "user" | "assistant",
+			text: string,
+		): SessionEntry => ({
+			type: "message",
+			id,
+			parentId,
+			timestamp: "2026-08-29T00:00:00.000Z",
+			message:
+				role === "user"
+					? { role, content: [{ type: "text", text }], timestamp: 1 }
+					: {
+							role,
+							content: [{ type: "text", text }],
+							api: "anthropic-messages",
+							provider: "anthropic",
+							model: "claude-sonnet-4-5",
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: 1,
+						},
+		});
+		store.entries.push(
+			message("branch-entry-1", null, "user", "original request"),
+			message("branch-entry-2", "branch-entry-1", "assistant", "original result"),
+			message("branch-entry-3", "branch-entry-2", "user", "abandoned follow-up"),
+			message("branch-entry-4", "branch-entry-3", "assistant", "abandoned result"),
+		);
+		store.leafId = "branch-entry-4";
+		store.reserved.add("entry-managed-branch-summary");
+		const sessionManager = await SessionManager.managed(store);
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Managed SDK test model is unavailable");
+		const authStorage = AuthStorage.inMemory({
+			[model.provider]: { type: "api_key", key: "managed-sdk-key" },
+		});
+		const modelRegistry = await createInMemoryModelRegistry(authStorage);
+		modelRegistry.registerProvider(model.provider, {
+			api: model.api,
+			streamSimple: () => {
+				order.push("provider");
+				const stream = createAssistantMessageEventStream();
+				stream.end({
+					role: "assistant",
+					content: [{ type: "text", text: "managed abandoned branch summary" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					usage: {
+						input: 10,
+						output: 5,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 15,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				});
+				return stream;
+			},
+		});
+		const providerAttemptGateway: ManagedProviderAttemptGateway = {
+			dispatch: async (request, execute) => {
+				order.push(`provider-attempt:dispatched:${request.requestId}:${request.purpose}`);
+				return {
+					receipt: {
+						attemptId: `sdk-maintenance-${request.requestId}`,
+						attemptVersion: 1,
+						purpose: request.purpose,
+					},
+					stream: await execute(),
+				};
+			},
+			settle: async (receipt, settlement) => {
+				order.push(
+					`provider-attempt:settled:${receipt.attemptId}:${settlement.status}:${settlement.responseEntryId ?? "none"}`,
+				);
+			},
+		};
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			model,
+			modelRuntime: getModelRuntime(modelRegistry),
+			noTools: "all",
+			sessionManager,
+			managedHost: {
+				managedLifecycleSink: async () => {},
+				managedQueueMaterializationHook: async () => [],
+				managedProviderAttemptGateway: providerAttemptGateway,
+				managedExtensionHost: {
+					getActivityBinding: () => ({
+						generationId: "generation_sdk",
+						generationLeaseToken: "lease_sdk",
+						activityToken: "branch_summary_sdk",
+						maintenanceActivityId: "maintenance-branch-summary-sdk",
+						maintenanceCoreId: "maintenance-core-branch-summary-sdk",
+					}),
+					dispatchExtensionAction: async (_request, execute) => execute(),
+					executeTool: async (_scope, execute) => execute(),
+				},
+				managedFailStopSink: async () => {},
+			},
+		});
+
+		try {
+			await expect(session.navigateTree("branch-entry-1", { summarize: true })).rejects.toThrow(
+				"requires navigateTreeManaged()",
+			);
+			const result = await session.navigateTreeManaged("branch-entry-1", {
+				activityToken: "branch_summary_sdk",
+				reservedEntryId: "entry-managed-branch-summary",
+			});
+			expect(result).toMatchObject({ cancelled: false, editorText: "original request" });
+			expect(store.entries.at(-1)).toMatchObject({
+				type: "branch_summary",
+				id: "entry-managed-branch-summary",
+				parentId: null,
+			});
+			expect(store.leafId).toBe("entry-managed-branch-summary");
+			expect(order).toContain("provider-attempt:dispatched:branch_summary_sdk:summary:1:branch_summary");
+			expect(order.indexOf("store:branch_summary")).toBeLessThan(
+				order.indexOf(
+					"provider-attempt:settled:sdk-maintenance-branch_summary_sdk:summary:1:completed:entry-managed-branch-summary",
+				),
+			);
+		} finally {
+			session.dispose();
+			modelRegistry.unregisterProvider(model.provider);
+		}
+	});
 });

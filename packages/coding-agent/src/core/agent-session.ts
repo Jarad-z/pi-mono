@@ -296,6 +296,21 @@ export interface ManagedCompactionOptions {
 	customInstructions?: string;
 }
 
+/** Options shared by legacy and managed in-session tree navigation. */
+export interface TreeNavigationOptions {
+	summarize?: boolean;
+	customInstructions?: string;
+	replaceInstructions?: boolean;
+	label?: string;
+}
+
+/** Explicit durable owner for one managed abandoned-branch summary. */
+export interface ManagedTreeNavigationOptions extends Omit<TreeNavigationOptions, "summarize"> {
+	activityToken: string;
+	reservedEntryId: string;
+	requestIdPrefix?: string;
+}
+
 /** A durable next-turn message frozen into the first provider-visible prompt batch. */
 export interface ManagedPromptStartBatchItem {
 	inputId: string;
@@ -3853,7 +3868,87 @@ export class AgentSession {
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
+		options: TreeNavigationOptions = {},
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (this.sessionManager.isManaged() && options.summarize) {
+			throw new Error("Managed SessionStore requires navigateTreeManaged() with a durable maintenance activity");
+		}
+		return this._navigateTree(targetId, options);
+	}
+
+	/** Navigate and summarize through an already-started durable MaintenanceActivity/Core. */
+	async navigateTreeManaged(
+		targetId: string,
+		options: ManagedTreeNavigationOptions,
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (!this.sessionManager.isManaged()) {
+			throw new Error("navigateTreeManaged() requires a managed SessionStore");
+		}
+		this.assertManagedGenerationAvailable();
+		for (const [label, value] of Object.entries({
+			activityToken: options.activityToken,
+			reservedEntryId: options.reservedEntryId,
+			requestIdPrefix: options.requestIdPrefix ?? `${options.activityToken}:summary`,
+		})) {
+			if (value.trim().length === 0 || value !== value.trim()) {
+				throw new Error(`Managed tree navigation ${label} must be a non-empty canonical string`);
+			}
+		}
+		if (options.label !== undefined) {
+			throw new Error("Managed branch summary labels require a separate durable Entry activity");
+		}
+		if (targetId === this.sessionManager.getLeafId()) {
+			throw new Error("Managed branch summary target must differ from the current leaf");
+		}
+		if (this.isStreaming || this._activeManagedActivityToken) {
+			throw new Error("A managed agent activity is already active");
+		}
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt || this._preparedManagedContinue) {
+			throw new Error("A managed prompt is already preparing or waiting for launch");
+		}
+		if (this._usedManagedActivityTokens.has(options.activityToken)) {
+			throw new Error(`Managed activity token ${options.activityToken} was already used`);
+		}
+		if (!this._managedProviderAttemptGateway || !this._managedExtensionHost) {
+			throw new Error("Managed branch summary requires ProviderAttempt and activity-binding gateways");
+		}
+
+		this._usedManagedActivityTokens.add(options.activityToken);
+		this._activeManagedActivityToken = options.activityToken;
+		try {
+			const binding = this._managedExtensionHost.getActivityBinding();
+			if (
+				!binding ||
+				binding.activityToken !== options.activityToken ||
+				binding.runId !== undefined ||
+				binding.coreInvocationId !== undefined ||
+				!binding.maintenanceActivityId ||
+				!binding.maintenanceCoreId
+			) {
+				throw new Error(`Managed branch summary has no bound maintenance Core: ${options.activityToken}`);
+			}
+			return await this._navigateTree(
+				targetId,
+				{
+					customInstructions: options.customInstructions,
+					replaceInstructions: options.replaceInstructions,
+					summarize: true,
+				},
+				{
+					activityToken: options.activityToken,
+					reservedEntryId: options.reservedEntryId,
+					requestIdPrefix: options.requestIdPrefix ?? `${options.activityToken}:summary`,
+				},
+			);
+		} finally {
+			this._activeManagedActivityToken = undefined;
+		}
+	}
+
+	private async _navigateTree(
+		targetId: string,
+		options: TreeNavigationOptions,
+		managedOptions?: { activityToken: string; reservedEntryId: string; requestIdPrefix: string },
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
@@ -3882,6 +3977,9 @@ export class AgentSession {
 			oldLeafId,
 			targetId,
 		);
+		if (managedOptions && entriesToSummarize.length === 0) {
+			throw new Error("Managed branch summary has no abandoned entries to summarize");
+		}
 
 		// Prepare event data - mutable so extensions can override
 		let customInstructions = options.customInstructions;
@@ -3901,6 +3999,9 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		const managed = managedOptions
+			? this._createManagedSummarizationContext("branch_summary", managedOptions.requestIdPrefix)
+			: undefined;
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -3934,15 +4035,15 @@ export class AgentSession {
 					label = result.label;
 				}
 			}
+			if (managedOptions && label !== undefined) {
+				throw new Error("Managed branch summary labels require a separate durable Entry activity");
+			}
 
 			// Run default summarizer if needed
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				if (this.sessionManager.isManaged()) {
-					throw new Error("Managed branch summary requires a durable ProviderAttempt summary activity");
-				}
 				const model = this.model!;
 				const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
@@ -3958,6 +4059,7 @@ export class AgentSession {
 					streamFn: this.agent.streamFunction,
 					retry: this.settingsManager.getRetrySettings(),
 					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
+					managed,
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };
@@ -4006,6 +4108,7 @@ export class AgentSession {
 							summaryDetails,
 							fromExtension,
 							summaryUsage,
+							managedOptions?.reservedEntryId,
 						)
 					: this.sessionManager.branchWithSummary(
 							newLeafId,
@@ -4015,6 +4118,9 @@ export class AgentSession {
 							summaryUsage,
 						);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+				if (managed) {
+					await this._settleManagedSummarizationCompleted(managed, summaryId);
+				}
 
 				// Attach label to the summary entry
 				if (label) {
@@ -4059,6 +4165,19 @@ export class AgentSession {
 			// Emit to custom tools
 
 			return { editorText, cancelled: false, summaryEntry };
+		} catch (error) {
+			let caughtError = error;
+			if (managed && managed.completedAttempts.length > 0) {
+				try {
+					await this._settleManagedSummarizationFailed(managed, caughtError);
+				} catch (settlementError) {
+					caughtError = new AggregateError(
+						[caughtError, settlementError],
+						"Managed branch summary failed and ProviderAttempt settlement also failed",
+					);
+				}
+			}
+			throw caughtError;
 		} finally {
 			this._branchSummaryAbortController = undefined;
 		}
