@@ -23,6 +23,7 @@ export {
 	type ManagedAgentSessionLifecycleSink,
 	type ManagedPromptOptions,
 	type ManagedPromptPreparation,
+	type ManagedPromptStartBatchItem,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,

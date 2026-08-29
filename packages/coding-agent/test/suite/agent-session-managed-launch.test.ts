@@ -373,6 +373,53 @@ describe("AgentSession managed paused launch", () => {
 		expect(sessionManager.getSessionFile()).toBeUndefined();
 	});
 
+	it("launches a frozen next-turn batch with reserved Entry identities before provider visibility", async () => {
+		const store = new ManagedLaunchSessionStore();
+		store.reserved.add("reserved_initial_batch_entry");
+		store.reserved.add("reserved_next_turn_entry");
+		const sessionManager = await SessionManager.managed(store);
+		const lifecycle: ManagedAgentSessionLifecycleEvent[] = [];
+		const harness = await createHarness({
+			sessionManager,
+			managedLifecycleSink: async (event) => {
+				lifecycle.push(event);
+			},
+			managedExtensionHost: managedExtensionHost("activity_start_batch"),
+			managedFailStopSink: ignoreManagedFailStop,
+			managedQueueMaterializationHook: async (items) =>
+				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		await harness.session.prepareManagedPrompt("activity_start_batch", "initial", {
+			reservedEntryId: "reserved_initial_batch_entry",
+		});
+		await harness.session.launchManagedPrompt("activity_start_batch", [{
+			inputId: "input_next_turn",
+			reservedEntryId: "reserved_next_turn_entry",
+			message: {
+				role: "user",
+				content: [{ type: "text", text: "next turn" }],
+				timestamp: Date.now(),
+			},
+		}]);
+
+		expect(harness.session.messages.map((message) => message.role)).toEqual(["user", "user", "assistant"]);
+		expect(store.entries.map((entry) => entry.id)).toEqual([
+			"reserved_initial_batch_entry",
+			"reserved_next_turn_entry",
+			"host_entry_1",
+		]);
+		expect(store.entries.map((entry) => entry.parentId)).toEqual([
+			null,
+			"reserved_initial_batch_entry",
+			"reserved_next_turn_entry",
+		]);
+		expect(lifecycle.filter((event) =>
+			event.type === "agent_event" && event.event.type === "message_end")).toHaveLength(3);
+	});
+
 	it("rejects a managed initial prompt without a host-reserved Entry identity", async () => {
 		const store = new ManagedLaunchSessionStore();
 		const sessionManager = await SessionManager.managed(store);

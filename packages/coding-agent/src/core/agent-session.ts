@@ -284,6 +284,13 @@ export type ManagedPromptPreparation =
 	| { outcome: "ready"; activityToken: string }
 	| { outcome: "handled"; activityToken: string };
 
+/** A durable next-turn message frozen into the first provider-visible prompt batch. */
+export interface ManagedPromptStartBatchItem {
+	inputId: string;
+	reservedEntryId: string;
+	message: AgentMessage;
+}
+
 /** Correlated lifecycle event delivered to the managed host before normal session observers. */
 export type ManagedAgentSessionLifecycleEvent =
 	| { type: "agent_event"; activityToken: string; event: AgentEvent }
@@ -1484,7 +1491,10 @@ export class AgentSession {
 	}
 
 	/** Start a previously prepared managed prompt with its stable activity token. */
-	async launchManagedPrompt(activityToken: string): Promise<void> {
+	async launchManagedPrompt(
+		activityToken: string,
+		startBatch: readonly ManagedPromptStartBatchItem[] = [],
+	): Promise<void> {
 		this.assertManagedGenerationAvailable();
 		const prepared = this._preparedManagedPrompt;
 		if (!prepared || prepared.activityToken !== activityToken) {
@@ -1493,14 +1503,37 @@ export class AgentSession {
 		if (this.isStreaming || this._activeManagedActivityToken) {
 			throw new Error("A managed agent activity is already active");
 		}
+		const inputIds = new Set<string>();
+		const reservedEntryIds = new Set<string>();
+		for (const item of startBatch) {
+			if (item.inputId.trim().length === 0 || item.inputId !== item.inputId.trim()) {
+				throw new Error("Managed start-batch input ID must be a non-empty canonical string");
+			}
+			if (item.reservedEntryId.trim().length === 0 || item.reservedEntryId !== item.reservedEntryId.trim()) {
+				throw new Error("Managed start-batch reserved Entry ID must be a non-empty canonical string");
+			}
+			if (inputIds.has(item.inputId) || reservedEntryIds.has(item.reservedEntryId)) {
+				throw new Error("Managed start-batch identities must be unique");
+			}
+			if (item.message.role !== "user") {
+				throw new Error("Managed start-batch messages must be user messages");
+			}
+			inputIds.add(item.inputId);
+			reservedEntryIds.add(item.reservedEntryId);
+		}
 
 		this._preparedManagedPrompt = undefined;
 		this._activeManagedActivityToken = activityToken;
 		try {
+			if (this.sessionManager.isManaged()) {
+				for (const item of startBatch) {
+					this.agent.registerManagedMessageEntryReservation(item.message, item.reservedEntryId);
+				}
+			}
 			if (this.agent.managedQueueMaterializationHook) {
 				this.agent.openManagedInputGate();
 			}
-			await this._runAgentPrompt(prepared.messages);
+			await this._runAgentPrompt([...prepared.messages, ...startBatch.map((item) => item.message)]);
 		} finally {
 			this._activeManagedActivityToken = undefined;
 		}
