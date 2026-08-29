@@ -24,7 +24,10 @@ class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMe
 	}
 }
 
-function assistant(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop") {
+function assistant(
+	content: AssistantMessage["content"],
+	stopReason: "deferred" | "length" | "stop" | "toolUse" = "stop",
+) {
 	return {
 		role: "assistant",
 		content,
@@ -64,7 +67,7 @@ describe("managed Agent fail-stop", () => {
 						attemptVersion: 1,
 						purpose: request.purpose,
 					},
-					stream: execute(),
+					stream: await execute(),
 				};
 			},
 			settle: async () => {

@@ -1544,6 +1544,8 @@ export interface ManagedHostActivityBinding {
 	activityToken: string;
 	runId?: string;
 	coreInvocationId?: string;
+	maintenanceActivityId?: string;
+	maintenanceCoreId?: string;
 }
 
 /** Causality attached to every mutation admitted from a managed extension handler. */

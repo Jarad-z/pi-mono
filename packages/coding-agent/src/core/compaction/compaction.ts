@@ -5,7 +5,14 @@
  * and after compaction the session is reloaded.
  */
 
-import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type {
+	AgentMessage,
+	ManagedProviderAttemptGateway,
+	ManagedProviderAttemptPurpose,
+	ManagedProviderAttemptReceipt,
+	StreamFn,
+	ThinkingLevel,
+} from "@earendil-works/pi-agent-core";
 import { contentText, type RetryCallbacks, type RetryPolicy, retryAssistantCall, uuidv7 } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
@@ -34,6 +41,20 @@ import {
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+}
+
+/** Successful managed summary calls awaiting the one durable summary Entry commit. */
+export interface ManagedSummarizationAttempt {
+	readonly receipt: ManagedProviderAttemptReceipt;
+	readonly response: AssistantMessage;
+}
+
+/** Durable ProviderAttempt scope shared by every LLM call in one summary operation. */
+export interface ManagedSummarizationContext {
+	readonly gateway: ManagedProviderAttemptGateway;
+	readonly purpose: Exclude<ManagedProviderAttemptPurpose, "run_core">;
+	readonly nextRequestId: () => string;
+	readonly completedAttempts: ManagedSummarizationAttempt[];
 }
 
 /**
@@ -566,6 +587,7 @@ export async function completeSummarization(
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	managed?: ManagedSummarizationContext,
 ): Promise<AssistantMessage> {
 	// Summaries are standalone requests, so isolate routing and avoid cache writes that cannot be reused.
 	const requestOptions: SimpleStreamOptions = {
@@ -573,10 +595,45 @@ export async function completeSummarization(
 		cacheRetention: "none",
 		sessionId: uuidv7(),
 	};
-	const produce = async (): Promise<AssistantMessage> =>
-		streamFn
-			? (await streamFn(model, context, requestOptions)).result()
-			: completeSimple(model, context, requestOptions);
+	const produce = async (): Promise<AssistantMessage> => {
+		if (!managed) {
+			return streamFn
+				? (await streamFn(model, context, requestOptions)).result()
+				: completeSimple(model, context, requestOptions);
+		}
+		if (!streamFn) {
+			throw new Error("Managed summarization requires the session stream function");
+		}
+		const dispatched = await managed.gateway.dispatch(
+			{
+				requestId: managed.nextRequestId(),
+				purpose: managed.purpose,
+				modelProvider: model.provider,
+				modelId: model.id,
+				modelApi: model.api,
+				context,
+				options: requestOptions,
+			},
+			() => streamFn(model, context, requestOptions),
+		);
+		let response: AssistantMessage;
+		try {
+			response = await dispatched.stream.result();
+		} catch (error) {
+			await managed.gateway.settle(dispatched.receipt, { status: "failed", error });
+			throw error;
+		}
+		if (response.stopReason === "error" || response.stopReason === "aborted") {
+			await managed.gateway.settle(dispatched.receipt, {
+				status: "failed",
+				response,
+				error: new Error(response.errorMessage ?? `Provider ${response.stopReason}`),
+			});
+		} else {
+			managed.completedAttempts.push({ receipt: dispatched.receipt, response });
+		}
+		return response;
+	};
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
 
@@ -598,6 +655,7 @@ export async function generateSummary(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	managed?: ManagedSummarizationContext,
 ): Promise<string> {
 	return (
 		await generateSummaryWithUsage(
@@ -614,6 +672,7 @@ export async function generateSummary(
 			env,
 			retry,
 			callbacks,
+			managed,
 		)
 	).text;
 }
@@ -633,6 +692,7 @@ export async function generateSummaryWithUsage(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	managed?: ManagedSummarizationContext,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -674,6 +734,7 @@ export async function generateSummaryWithUsage(
 		streamFn,
 		retry,
 		callbacks,
+		managed,
 	);
 
 	if (response.stopReason === "error") {
@@ -826,6 +887,7 @@ export async function compact(
 	env?: Record<string, string>,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	managed?: ManagedSummarizationContext,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -860,6 +922,7 @@ export async function compact(
 				env,
 				retry,
 				callbacks,
+				managed,
 			);
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
@@ -876,6 +939,7 @@ export async function compact(
 			streamFn,
 			retry,
 			callbacks,
+			managed,
 		);
 		// Merge into single summary
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
@@ -896,6 +960,7 @@ export async function compact(
 			env,
 			retry,
 			callbacks,
+			managed,
 		);
 		summary = result.text;
 		summaryUsage = result.usage;
@@ -933,6 +998,7 @@ async function generateTurnPrefixSummary(
 	streamFn?: StreamFn,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	managed?: ManagedSummarizationContext,
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
@@ -956,6 +1022,7 @@ async function generateTurnPrefixSummary(
 		streamFn,
 		retry,
 		callbacks,
+		managed,
 	);
 
 	if (response.stopReason === "error") {

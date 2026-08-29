@@ -19,6 +19,7 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	ManagedProviderAttemptDispatch,
 	StreamFn,
 } from "./types.ts";
 import { isManagedAgentFailStopError, ManagedAgentFailStopError } from "./types.ts";
@@ -314,21 +315,21 @@ async function streamAssistantResponse(
 	delete streamOptions.managedProviderAttemptGateway;
 	delete streamOptions.nextManagedProviderRequestId;
 	const gateway = config.managedProviderAttemptGateway;
-	let dispatched;
+	let dispatched: ManagedProviderAttemptDispatch | undefined;
 	try {
 		dispatched = gateway
 			? await gateway.dispatch(
-				{
-					requestId: config.nextManagedProviderRequestId?.() ?? "1",
-					purpose: "run_core",
-					modelProvider: config.model.provider,
-					modelId: config.model.id,
-					modelApi: config.model.api,
-					context: llmContext,
-					options: streamOptions,
-				},
-				() => streamFunction(config.model, llmContext, streamOptions),
-			)
+					{
+						requestId: config.nextManagedProviderRequestId?.() ?? "1",
+						purpose: "run_core",
+						modelProvider: config.model.provider,
+						modelId: config.model.id,
+						modelApi: config.model.api,
+						context: llmContext,
+						options: streamOptions,
+					},
+					() => streamFunction(config.model, llmContext, streamOptions),
+				)
 			: undefined;
 	} catch (error) {
 		if (isManagedAgentFailStopError(error)) throw error;

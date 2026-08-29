@@ -74,6 +74,7 @@ import {
 	estimateContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	type ManagedSummarizationContext,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
@@ -286,6 +287,14 @@ export type ManagedPromptOptions = Omit<PromptOptions, "streamingBehavior" | "pr
 export type ManagedPromptPreparation =
 	| { outcome: "ready"; activityToken: string }
 	| { outcome: "handled"; activityToken: string };
+
+/** Explicit durable owner for one standalone managed manual compaction. */
+export interface ManagedCompactionOptions {
+	activityToken: string;
+	reservedEntryId: string;
+	requestIdPrefix?: string;
+	customInstructions?: string;
+}
 
 /** A durable next-turn message frozen into the first provider-visible prompt batch. */
 export interface ManagedPromptStartBatchItem {
@@ -515,8 +524,10 @@ export class AgentSession {
 		if (config.managedProviderAttemptGateway && !config.managedLifecycleSink) {
 			throw new Error("Managed ProviderAttempt gateway requires a managed lifecycle sink");
 		}
-		if (config.managedProviderAttemptGateway
-			&& this.agent.managedProviderAttemptGateway !== config.managedProviderAttemptGateway) {
+		if (
+			config.managedProviderAttemptGateway &&
+			this.agent.managedProviderAttemptGateway !== config.managedProviderAttemptGateway
+		) {
 			throw new Error("Agent already has a different managed ProviderAttempt gateway");
 		}
 		if (config.managedQueueMaterializationHook && this.agent.hasQueuedMessages()) {
@@ -942,10 +953,17 @@ export class AgentSession {
 					);
 				}
 				try {
-					await this._managedProviderAttemptGateway.settle(event.managedProviderAttempt, {
-						responseEntryId: managedEntryId,
-						response: event.message,
-					});
+					await this._managedProviderAttemptGateway.settle(
+						event.managedProviderAttempt,
+						event.message.stopReason === "error" || event.message.stopReason === "aborted"
+							? {
+									status: "failed",
+									responseEntryId: managedEntryId,
+									response: event.message,
+									error: new Error(event.message.errorMessage ?? `Provider ${event.message.stopReason}`),
+								}
+							: { status: "completed", responseEntryId: managedEntryId, response: event.message },
+					);
 				} catch (error) {
 					throw await this.failStopManagedBoundary(error, "managed_host_boundary");
 				}
@@ -2519,15 +2537,125 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _createManagedSummarizationContext(
+		purpose: ManagedSummarizationContext["purpose"],
+		requestIdPrefix: string,
+	): ManagedSummarizationContext {
+		const gateway = this._managedProviderAttemptGateway;
+		if (!gateway) {
+			throw new Error("Managed summarization requires a ProviderAttempt gateway");
+		}
+		let requestOrdinal = 0;
+		return {
+			gateway,
+			purpose,
+			completedAttempts: [],
+			nextRequestId: () => `${requestIdPrefix}:${++requestOrdinal}`,
+		};
+	}
+
+	private async _settleManagedSummarizationCompleted(
+		managed: ManagedSummarizationContext,
+		responseEntryId: string,
+	): Promise<void> {
+		while (managed.completedAttempts.length > 0) {
+			const attempt = managed.completedAttempts.shift()!;
+			await managed.gateway.settle(attempt.receipt, {
+				status: "completed",
+				responseEntryId,
+				response: attempt.response,
+			});
+		}
+	}
+
+	private async _settleManagedSummarizationFailed(
+		managed: ManagedSummarizationContext,
+		error: unknown,
+	): Promise<void> {
+		while (managed.completedAttempts.length > 0) {
+			const attempt = managed.completedAttempts.shift()!;
+			await managed.gateway.settle(attempt.receipt, {
+				status: "failed",
+				response: attempt.response,
+				error,
+			});
+		}
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		if (this.sessionManager.isManaged()) {
+			throw new Error("Managed SessionStore requires compactManaged() with a durable maintenance activity");
+		}
+		return this._compact(customInstructions);
+	}
+
+	/** Compact through an already-started durable MaintenanceActivity/Core. */
+	async compactManaged(options: ManagedCompactionOptions): Promise<CompactionResult> {
+		if (!this.sessionManager.isManaged()) {
+			throw new Error("compactManaged() requires a managed SessionStore");
+		}
+		this.assertManagedGenerationAvailable();
+		for (const [label, value] of Object.entries({
+			activityToken: options.activityToken,
+			reservedEntryId: options.reservedEntryId,
+			requestIdPrefix: options.requestIdPrefix ?? `${options.activityToken}:summary`,
+		})) {
+			if (value.trim().length === 0 || value !== value.trim()) {
+				throw new Error(`Managed compaction ${label} must be a non-empty canonical string`);
+			}
+		}
+		if (this.isStreaming || this._activeManagedActivityToken) {
+			throw new Error("A managed agent activity is already active");
+		}
+		if (this._managedPromptPreparationToken || this._preparedManagedPrompt || this._preparedManagedContinue) {
+			throw new Error("A managed prompt is already preparing or waiting for launch");
+		}
+		if (this._usedManagedActivityTokens.has(options.activityToken)) {
+			throw new Error(`Managed activity token ${options.activityToken} was already used`);
+		}
+		if (!this._managedProviderAttemptGateway || !this._managedExtensionHost) {
+			throw new Error("Managed compaction requires ProviderAttempt and activity-binding gateways");
+		}
+
+		this._usedManagedActivityTokens.add(options.activityToken);
+		this._activeManagedActivityToken = options.activityToken;
+		try {
+			const binding = this._managedExtensionHost.getActivityBinding();
+			if (
+				!binding ||
+				binding.activityToken !== options.activityToken ||
+				binding.runId !== undefined ||
+				binding.coreInvocationId !== undefined ||
+				!binding.maintenanceActivityId ||
+				!binding.maintenanceCoreId
+			) {
+				throw new Error(`Managed compaction has no bound maintenance Core: ${options.activityToken}`);
+			}
+			return await this._compact(options.customInstructions, {
+				activityToken: options.activityToken,
+				reservedEntryId: options.reservedEntryId,
+				requestIdPrefix: options.requestIdPrefix ?? `${options.activityToken}:summary`,
+			});
+		} finally {
+			this._activeManagedActivityToken = undefined;
+		}
+	}
+
+	private async _compact(
+		customInstructions?: string,
+		managedOptions?: { activityToken: string; reservedEntryId: string; requestIdPrefix: string },
+	): Promise<CompactionResult> {
 		await this.abort();
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
+		const managed = managedOptions
+			? this._createManagedSummarizationContext("manual_compaction", managedOptions.requestIdPrefix)
+			: undefined;
 
 		try {
 			if (!this.model) {
@@ -2587,11 +2715,6 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				if (this.sessionManager.isManaged()) {
-					throw new Error(
-						"Managed manual compaction requires a durable ProviderAttempt summary activity",
-					);
-				}
 				// Generate compaction result
 				const result = await compact(
 					preparation,
@@ -2605,6 +2728,7 @@ export class AgentSession {
 					env,
 					this.settingsManager.getRetrySettings(),
 					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+					managed,
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2617,14 +2741,16 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			if (this.sessionManager.isManaged()) {
-				await this.sessionManager.appendManagedCompaction(
+			let committedEntryId: string | undefined;
+			if (managedOptions) {
+				committedEntryId = await this.sessionManager.appendManagedCompaction(
 					summary,
 					firstKeptEntryId,
 					tokensBefore,
 					details,
 					fromExtension,
 					usage,
+					managedOptions.reservedEntryId,
 				);
 			} else {
 				this.sessionManager.appendCompaction(
@@ -2635,6 +2761,9 @@ export class AgentSession {
 					fromExtension,
 					usage,
 				);
+			}
+			if (managed && committedEntryId) {
+				await this._settleManagedSummarizationCompleted(managed, committedEntryId);
 			}
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -2675,8 +2804,20 @@ export class AgentSession {
 			});
 			return compactionResult;
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
+			let caughtError = error;
+			if (managed && managed.completedAttempts.length > 0) {
+				try {
+					await this._settleManagedSummarizationFailed(managed, caughtError);
+				} catch (settlementError) {
+					caughtError = new AggregateError(
+						[caughtError, settlementError],
+						"Managed compaction failed and ProviderAttempt settlement also failed",
+					);
+				}
+			}
+			const message = caughtError instanceof Error ? caughtError.message : String(caughtError);
+			const aborted =
+				message === "Compaction cancelled" || (caughtError instanceof Error && caughtError.name === "AbortError");
 			this._compactionAbortController = undefined;
 			this._emit({
 				type: "compaction_end",
@@ -2686,7 +2827,7 @@ export class AgentSession {
 				willRetry: false,
 				errorMessage: aborted ? undefined : `Compaction failed: ${message}`,
 			});
-			throw error;
+			throw caughtError;
 		} finally {
 			this._compactionAbortController = undefined;
 		}
@@ -2883,9 +3024,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				if (this.sessionManager.isManaged()) {
-					throw new Error(
-						"Managed auto-compaction requires a durable ProviderAttempt summary activity",
-					);
+					throw new Error("Managed auto-compaction requires a durable ProviderAttempt summary activity");
 				}
 				// Generate compaction result
 				const compactResult = await compact(
@@ -3802,9 +3941,7 @@ export class AgentSession {
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				if (this.sessionManager.isManaged()) {
-					throw new Error(
-						"Managed branch summary requires a durable ProviderAttempt summary activity",
-					);
+					throw new Error("Managed branch summary requires a durable ProviderAttempt summary activity");
 				}
 				const model = this.model!;
 				const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);

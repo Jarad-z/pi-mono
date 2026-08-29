@@ -61,10 +61,18 @@ export interface ManagedProviderAttemptDispatch {
 	readonly stream: AssistantMessageEventStream;
 }
 
-export interface ManagedProviderAttemptSettlement {
-	readonly responseEntryId: string;
-	readonly response: AssistantMessage;
-}
+export type ManagedProviderAttemptSettlement =
+	| {
+			readonly status: "completed";
+			readonly responseEntryId: string;
+			readonly response: AssistantMessage;
+	  }
+	| {
+			readonly status: "failed";
+			readonly responseEntryId?: string;
+			readonly response?: AssistantMessage;
+			readonly error?: unknown;
+	  };
 
 /** Durable boundary immediately before Provider visibility and after response Entry commit. */
 export interface ManagedProviderAttemptGateway {
@@ -72,10 +80,7 @@ export interface ManagedProviderAttemptGateway {
 		request: ManagedProviderAttemptRequest,
 		execute: () => AssistantMessageEventStream | Promise<AssistantMessageEventStream>,
 	): Promise<ManagedProviderAttemptDispatch>;
-	settle(
-		receipt: ManagedProviderAttemptReceipt,
-		settlement: ManagedProviderAttemptSettlement,
-	): Promise<void>;
+	settle(receipt: ManagedProviderAttemptReceipt, settlement: ManagedProviderAttemptSettlement): Promise<void>;
 }
 
 /**
