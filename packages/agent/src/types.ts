@@ -72,7 +72,18 @@ export interface ManagedQueueTicket {
 /** Result of staging a stable managed queue item. */
 export type ManagedQueueStageResult =
 	| { type: "staged"; ticket: ManagedQueueTicket }
-	| { type: "duplicate"; ticket: ManagedQueueTicket; phase: ManagedQueueItemPhase };
+	| { type: "duplicate"; ticket: ManagedQueueTicket; phase: ManagedQueueItemPhase }
+	| { type: "gate_closed"; gateRevision: number };
+
+/** Atomic managed input-gate close result over the process-local QueueMirror. */
+export type ManagedQueueInputGateCloseResult =
+	| { type: "closed"; gateRevision: number; queueStateRevision: number }
+	| {
+			type: "blocked";
+			gateRevision: number;
+			queueStateRevision: number;
+			items: readonly ManagedQueueMirrorItemSnapshot[];
+	  };
 
 /** Result of acknowledging durable admission for a staged item. */
 export type ManagedQueueAdmissionResult = "admitted" | "already_admitted" | "stale";

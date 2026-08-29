@@ -69,6 +69,38 @@ function createAgent(
 }
 
 describe("Agent managed queue mirror", () => {
+	it("closes atomically only after provisional QueueMirror state drains", async () => {
+		const agent = createAgent(async (items) =>
+			items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
+		);
+		const staged = agent.stageManagedQueueItem({ itemId: "input_1", lane: "steer", message: user("first") });
+		if (staged.type !== "staged") throw new Error("Expected staged ticket");
+
+		const blocked = agent.tryCloseManagedInputGate();
+		expect(blocked).toMatchObject({
+			type: "blocked",
+			gateRevision: 0,
+			items: [{ itemId: "input_1", phase: "staged" }],
+		});
+		const changed = agent.waitForManagedQueueMutation(blocked.queueStateRevision);
+		agent.admitManagedQueueItem(staged.ticket);
+		await changed;
+		agent.publishManagedQueueItem(staged.ticket);
+		expect(agent.tryCloseManagedInputGate()).toMatchObject({
+			type: "blocked",
+			items: [{ itemId: "input_1", phase: "published" }],
+		});
+		expect(agent.removeManagedQueueItem("input_1")).toBe("removed");
+		expect(agent.tryCloseManagedInputGate()).toMatchObject({ type: "closed", gateRevision: 1 });
+		expect(agent.stageManagedQueueItem({ itemId: "input_2", lane: "steer", message: user("later") })).toEqual({
+			type: "gate_closed",
+			gateRevision: 1,
+		});
+		expect(agent.openManagedInputGate()).toBe(2);
+		expect(agent.stageManagedQueueItem({ itemId: "input_2", lane: "steer", message: user("later") }).type)
+			.toBe("staged");
+	});
+
 	it("keeps staged and admitted items non-drainable until fenced publish", async () => {
 		const selectedBatches: string[][] = [];
 		const providerContexts: AgentMessage[][] = [];

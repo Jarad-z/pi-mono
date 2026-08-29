@@ -26,6 +26,7 @@ import type {
 	ManagedQueueAdmissionResult,
 	ManagedQueueItemInput,
 	ManagedQueueItemPhase,
+	ManagedQueueInputGateCloseResult,
 	ManagedQueueLane,
 	ManagedQueueMaterializationDecision,
 	ManagedQueueMaterializationHook,
@@ -240,6 +241,10 @@ export class Agent {
 	private readonly consumedManagedQueueItems = new Map<string, ManagedQueueTicket>();
 	private readonly managedMessageEntryReservations = new WeakMap<object, string>();
 	private managedQueueMirrorRevision = 0;
+	private managedQueueStateRevision = 0;
+	private managedInputGateRevision = 0;
+	private managedInputGateOpen = true;
+	private readonly managedQueueMutationWaiters = new Set<() => void>();
 	private managedQueueFailure: Error | undefined;
 	private managedFailStopError: ManagedAgentFailStopError | undefined;
 	private managedFailStopPromise: Promise<void> | undefined;
@@ -379,6 +384,9 @@ export class Agent {
 		if (input.itemId.trim().length === 0 || input.itemId !== input.itemId.trim()) {
 			throw new Error("Managed queue item ID must be a non-empty canonical string");
 		}
+		if (!this.managedInputGateOpen) {
+			return { type: "gate_closed", gateRevision: this.managedInputGateRevision };
+		}
 
 		const existing = this.managedQueueItems.get(input.itemId);
 		if (existing) {
@@ -402,6 +410,7 @@ export class Agent {
 		};
 		this.managedQueueItems.set(item.itemId, item);
 		this.queueFor(item.lane).stage(item);
+		this.noteManagedQueueMutation();
 		return { type: "staged", ticket: this.ticketFor(item) };
 	}
 
@@ -414,6 +423,7 @@ export class Agent {
 		}
 		if (item.phase === "staged") {
 			item.phase = "admitted";
+			this.noteManagedQueueMutation();
 			return "admitted";
 		}
 		return "already_admitted";
@@ -431,6 +441,7 @@ export class Agent {
 		}
 		if (item.phase === "admitted") {
 			item.phase = "published";
+			this.noteManagedQueueMutation();
 			return "published";
 		}
 		return "already_published";
@@ -485,6 +496,65 @@ export class Agent {
 			mirrorRevision: item.mirrorRevision,
 			phase: item.phase,
 		}));
+	}
+
+	/** Open the process-local managed input gate for a new activity. */
+	openManagedInputGate(): number {
+		this.assertManagedGenerationAvailable();
+		if (!this.managedQueueMaterializationHook) {
+			throw new Error("Managed input gate requires a managed queue materialization hook");
+		}
+		if (this.managedQueueItems.size > 0) {
+			throw new Error("Managed input gate cannot open while QueueMirror items remain");
+		}
+		if (!this.managedInputGateOpen) {
+			this.managedInputGateOpen = true;
+			this.managedInputGateRevision += 1;
+			this.noteManagedQueueMutation();
+		}
+		return this.managedInputGateRevision;
+	}
+
+	/** Close only when the same synchronous QueueMirror critical section is empty. */
+	tryCloseManagedInputGate(): ManagedQueueInputGateCloseResult {
+		this.assertManagedGenerationAvailable();
+		if (!this.managedQueueMaterializationHook) {
+			throw new Error("Managed input gate requires a managed queue materialization hook");
+		}
+		if (!this.managedInputGateOpen) {
+			return {
+				type: "closed",
+				gateRevision: this.managedInputGateRevision,
+				queueStateRevision: this.managedQueueStateRevision,
+			};
+		}
+		const items = this.getManagedQueueMirrorSnapshot();
+		if (items.length > 0) {
+			return {
+				type: "blocked",
+				gateRevision: this.managedInputGateRevision,
+				queueStateRevision: this.managedQueueStateRevision,
+				items,
+			};
+		}
+		this.managedInputGateOpen = false;
+		this.managedInputGateRevision += 1;
+		this.noteManagedQueueMutation();
+		return {
+			type: "closed",
+			gateRevision: this.managedInputGateRevision,
+			queueStateRevision: this.managedQueueStateRevision,
+		};
+	}
+
+	/** Wait until stage/admit/publish/remove changes close eligibility. */
+	waitForManagedQueueMutation(observedRevision: number): Promise<void> {
+		if (this.managedQueueStateRevision !== observedRevision) {
+			return Promise.resolve();
+		}
+		return new Promise<void>((resolve) => {
+			this.managedQueueMutationWaiters.add(resolve);
+		});
 	}
 
 	/** Attach a host-reserved durable Entry identity to an exact managed message object. */
@@ -560,6 +630,14 @@ export class Agent {
 			throw new Error(`Managed queue item ${item.itemId} is not pending in its declared lane`);
 		}
 		this.managedQueueItems.delete(item.itemId);
+		this.noteManagedQueueMutation();
+	}
+
+	private noteManagedQueueMutation(): void {
+		this.managedQueueStateRevision += 1;
+		const waiters = [...this.managedQueueMutationWaiters];
+		this.managedQueueMutationWaiters.clear();
+		for (const resolve of waiters) resolve();
 	}
 
 	private forgetClearedManagedItems(items: readonly ManagedPendingMessage[]): void {

@@ -293,6 +293,56 @@ describe("AgentSession managed paused launch", () => {
 		expect(harness.session.getManagedQueueMirrorSnapshot()).toEqual([]);
 	});
 
+	it("waits for provisional admission before atomically closing the managed input gate", async () => {
+		const stagedSeen = deferred();
+		let stagedTicket: ReturnType<Harness["session"]["stageManagedQueueItem"]> | undefined;
+		let stagedOnce = false;
+		let launchFinished = false;
+		let harness!: Harness;
+		harness = await createHarness({
+			managedLifecycleSink: async (event) => {
+				if (!stagedOnce && event.type === "agent_event" && event.event.type === "agent_end") {
+					stagedOnce = true;
+					stagedTicket = harness.session.stageManagedQueueItem({
+						itemId: "input_gate_race",
+						lane: "steer",
+						message: { role: "user", content: [{ type: "text", text: "continue" }], timestamp: Date.now() },
+					});
+					stagedSeen.resolve();
+				}
+			},
+			managedExtensionHost: managedExtensionHost("activity_gate_race"),
+			managedFailStopSink: ignoreManagedFailStop,
+			managedQueueMaterializationHook: async (items) =>
+				items.map((item) => ({ type: "materialized", itemId: item.itemId, message: item.message })),
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+		await harness.session.prepareManagedPrompt("activity_gate_race", "hello");
+
+		const launch = harness.session.launchManagedPrompt("activity_gate_race").then(() => {
+			launchFinished = true;
+		});
+		await stagedSeen.promise;
+		await Promise.resolve();
+		expect(launchFinished).toBe(false);
+		expect(stagedTicket?.type).toBe("staged");
+		if (stagedTicket?.type !== "staged") throw new Error("Expected provisional managed ticket");
+		expect(harness.session.getManagedQueueMirrorSnapshot()).toEqual([
+			expect.objectContaining({ itemId: "input_gate_race", phase: "staged" }),
+		]);
+
+		expect(harness.session.admitManagedQueueItem(stagedTicket.ticket)).toBe("admitted");
+		expect(harness.session.publishManagedQueueItem(stagedTicket.ticket)).toBe("published");
+		await launch;
+		expect(launchFinished).toBe(true);
+		expect(harness.session.stageManagedQueueItem({
+			itemId: "input_after_close",
+			lane: "steer",
+			message: { role: "user", content: [{ type: "text", text: "later" }], timestamp: Date.now() },
+		})).toEqual({ type: "gate_closed", gateRevision: 1 });
+	});
+
 	it("persists reserved managed entries before public message_end visibility", async () => {
 		const store = new ManagedLaunchSessionStore();
 		store.reserved.add("reserved_initial_entry");

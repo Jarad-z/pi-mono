@@ -1377,6 +1377,18 @@ export class AgentSession {
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
+		if (this._managedLifecycleSink && this.agent.managedQueueMaterializationHook) {
+			while (true) {
+				const close = this.agent.tryCloseManagedInputGate();
+				if (close.type === "closed") {
+					return false;
+				}
+				if (this.agent.hasQueuedMessages()) {
+					return true;
+				}
+				await this.agent.waitForManagedQueueMutation(close.queueStateRevision);
+			}
+		}
 		return this.agent.hasQueuedMessages();
 	}
 
@@ -1485,6 +1497,9 @@ export class AgentSession {
 		this._preparedManagedPrompt = undefined;
 		this._activeManagedActivityToken = activityToken;
 		try {
+			if (this.agent.managedQueueMaterializationHook) {
+				this.agent.openManagedInputGate();
+			}
 			await this._runAgentPrompt(prepared.messages);
 		} finally {
 			this._activeManagedActivityToken = undefined;
